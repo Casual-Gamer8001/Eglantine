@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -191,9 +192,18 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
     // structures next to the draw arguments its compute dispatches fill in; the draws then read
     // leftover bytes as vertex counts. Download those bytes first (the CPU's own were subtracted
     // above, so they aren't overwritten).
+    // EDEN_NX2_PAGE_DOWNLOADS=0 skips this download: it waits for the host GPU to finish all
+    // submitted work (a third of the GPU back thread in Ocarina of Time), and it writes the GPU's
+    // bytes back while the guest runs, over any the CPU wrote there since and that are not
+    // gathered yet.
+    static const bool page_downloads = [] {
+        const char* value = std::getenv("EDEN_NX2_PAGE_DOWNLOADS");
+        return value == nullptr || value[0] != '0';
+    }();
     const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
-    if (keep_page_gpu_data && gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
+    if (keep_page_gpu_data && page_downloads &&
+        gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
         DownloadMemory(page_begin, page_end - page_begin);
     }
     memory_tracker.MarkRegionAsCpuModified(device_addr, size);
