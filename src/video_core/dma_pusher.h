@@ -10,9 +10,12 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <optional>
 #include <span>
+#include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 #include <deque>
@@ -196,8 +199,10 @@ private:
     size_t command_resume_offset{}; ///< Words of the current entry done before a suspension
 
     void SetState(const CommandHeader& command_header);
-    /// Whether a header is one no driver writes (IsImpossibleHostSequence); logs and skips it.
-    bool SkipImpossibleHeader(const CommandHeader& command_header);
+    /// Whether a header is one no driver writes (IsImpossibleHostSequence,
+    /// IsImpossibleEngineSequence); logs it, dumps the first few submissions holding one
+    /// (DumpMisreadSubmission) and skips it. word_index: its position in the current entry.
+    bool SkipImpossibleHeader(const CommandHeader& command_header, size_t word_index);
 
     void CallMethod(u32 argument);
     void CallMultiMethod(const u32* base_start, u32 num_methods);
@@ -272,8 +277,26 @@ public:
     /// An entry starts away from where an unfinished method's entry ended: log it and, with
     /// EDEN_NX2_SPLIT_DUMP, write the submission around it out.
     void DumpSplitAcrossEntries(const CommandList& list, size_t index);
+    /// EDEN_NX2_SPLIT_DUMP: writes the submission an impossible header was read in.
+    void DumpMisreadSubmission(const CommandList& list, const CommandHeader& header,
+                               size_t word_index, u32 event);
+    /// Channel, submission, how it was submitted and whether its snapshot is current (dumps).
+    [[nodiscard]] std::string DescribeSubmission(const CommandList& list) const;
+    /// Writes every GP entry of the submission, with the given marks (dumps).
+    void WriteSubmissionEntries(std::FILE* file, const CommandList& list,
+                                std::span<const std::pair<size_t, const char*>> marks);
+    /// Writes the words of entries first..last as submitted and as in memory now (dumps).
+    void WriteEntryWords(std::FILE* file, const CommandList& list, size_t first, size_t last);
     u64 splits_continued{}; ///< Unfinished methods the next entry continued in place
     u64 splits_elsewhere{}; ///< ... whose next entry started elsewhere
+    /// EDEN_NX2_SPLIT_DUMP: the last headers parsed, for DumpMisreadSubmission.
+    struct ParsedHeader {
+        GPUVAddr address;
+        u32 word;
+        u32 entry;
+    };
+    std::array<ParsedHeader, 64> recent_headers{};
+    u64 recent_header_count{};
 
     /// EDEN_NX2_GPU_LIST_STATS=1 (diagnostics): how command lists the GPU writes were read.
     [[nodiscard]] static bool GpuListStatsEnabled();
@@ -298,6 +321,9 @@ public:
     /// Whether a header writing methods first..last is one no driver writes: host methods that
     /// include NV_UDMA_ILLEGAL (1) or run on into the engine's methods (0x40 and up).
     [[nodiscard]] static bool IsImpossibleHostSequence(u32 first, u32 last);
+    /// ... engine methods past the last any class has (0xfff), an Increasing run longer than any
+    /// state block (run: its word count), or one that runs on from the registers into the macros.
+    [[nodiscard]] static bool IsImpossibleEngineSequence(u32 first, u32 last, u32 run);
 
     // Debug aid: hashes of the words of the last entries as they were parsed.
     struct ParsedEntry {

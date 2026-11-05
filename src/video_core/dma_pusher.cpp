@@ -29,6 +29,16 @@ namespace Tegra {
 
 constexpr u32 MacroRegistersStart = 0xE00;
 constexpr u32 ComputeInline = 0x6D;
+/// No engine class has methods past its macro calls (0xe00-0xfff).
+constexpr u32 EngineMethodsEnd = 0x1000;
+/// More registers than any state block one Increasing header writes.
+constexpr u32 MaxIncreasingRun = 0x400;
+
+/// EDEN_NX2_SPLIT_DUMP=<dir>: where splits across entries and misread submissions are written.
+static const char* PushbufferDumpDirectory() {
+    static const char* const directory = std::getenv("EDEN_NX2_SPLIT_DUMP");
+    return directory;
+}
 
 DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_)
     : system{system_}
@@ -335,10 +345,17 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
             index++;
         } else {
             auto const command_header = commands[index]; //can copy
+            if (PushbufferDumpDirectory() != nullptr) [[unlikely]] {
+                recent_headers[recent_header_count++ % recent_headers.size()] = {
+                    .address = dma_state.dma_get + (word_offset + index) * sizeof(u32),
+                    .word = command_header.argument,
+                    .entry = static_cast<u32>(dma_pushbuffer_subindex),
+                };
+            }
             // No command active - this is the first word of a new one
             switch (command_header.mode) {
             case SubmissionMode::Increasing:
-                if (SkipImpossibleHeader(command_header)) [[unlikely]] {
+                if (SkipImpossibleHeader(command_header, word_offset + index)) [[unlikely]] {
                     break;
                 }
                 SetState(command_header);
@@ -346,7 +363,7 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
                 dma_increment_once = false;
                 break;
             case SubmissionMode::NonIncreasing:
-                if (SkipImpossibleHeader(command_header)) [[unlikely]] {
+                if (SkipImpossibleHeader(command_header, word_offset + index)) [[unlikely]] {
                     break;
                 }
                 SetState(command_header);
@@ -354,6 +371,9 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
                 dma_increment_once = false;
                 break;
             case SubmissionMode::Inline:
+                if (SkipImpossibleHeader(command_header, word_offset + index)) [[unlikely]] {
+                    break;
+                }
                 dma_state.method = command_header.method;
                 dma_state.subchannel = command_header.subchannel;
                 dma_state.dma_word_offset = u64(-s64(dma_state.dma_get)); // negate to set address as 0
@@ -362,7 +382,7 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
                 dma_increment_once = false;
                 break;
             case SubmissionMode::IncreaseOnce:
-                if (SkipImpossibleHeader(command_header)) [[unlikely]] {
+                if (SkipImpossibleHeader(command_header, word_offset + index)) [[unlikely]] {
                     break;
                 }
                 SetState(command_header);
@@ -447,7 +467,7 @@ void DmaPusher::DumpSplitAcrossEntries(const CommandList& list, size_t index) {
                  entries.size(), list.submit_sequence, channel_state.bind_id, u64{current.addr},
                  split_method_end, splits_elsewhere, splits_continued);
     }
-    static const char* const directory = std::getenv("EDEN_NX2_SPLIT_DUMP");
+    const char* const directory = PushbufferDumpDirectory();
     if (directory == nullptr || event >= 16) {
         return;
     }
@@ -475,16 +495,7 @@ void DmaPusher::DumpSplitAcrossEntries(const CommandList& list, size_t index) {
             break;
         }
     }
-    static constexpr std::array submit_kinds{"emulator-built", "SubmitGpfifo (entries in the ioctl)",
-                                             "KickoffPb (entries in guest memory)",
-                                             "SubmitGpfifo (inline input)"};
-    const bool snapshot_valid =
-        (list.snapshot_suspensions & 1) == 0 &&
-        list.snapshot_suspensions == suspensions.load(std::memory_order_acquire);
-    put(fmt::format("split #{}: channel {}, submission {} via {}, {} entries", event,
-                    channel_state.bind_id, list.submit_sequence,
-                    submit_kinds[(std::min<size_t>)(list.submit_kind, submit_kinds.size() - 1)],
-                    entries.size()));
+    put(fmt::format("split #{}: {}", event, DescribeSubmission(list)));
     put(fmt::format("pending: method {:#x} sub {} count {} non_incrementing {} increment_once {}",
                     dma_state.method, dma_state.subchannel, dma_state.method_count,
                     dma_state.non_incrementing, static_cast<bool>(dma_increment_once)));
@@ -492,13 +503,51 @@ void DmaPusher::DumpSplitAcrossEntries(const CommandList& list, size_t index) {
                     unfinished, split_method_end, index, u64{current.addr},
                     resumes ? fmt::format("entry {} continues at {:#x}", *resumes, split_method_end)
                             : std::string{"no later entry continues there"}));
-    put(fmt::format("snapshot: {} (taken at suspension count {}, now {})",
-                    list.submitted_offsets.empty() ? "none"
-                    : snapshot_valid               ? "valid"
-                                                   : "stale",
-                    list.snapshot_suspensions, suspensions.load(std::memory_order_acquire)));
     put(fmt::format("splits so far: {} elsewhere, {} continued in place", splits_elsewhere,
                     splits_continued));
+    std::vector<std::pair<size_t, const char*>> marks{
+        {unfinished, "ended inside the method"},
+        {index, "starts elsewhere"},
+    };
+    if (resumes) {
+        marks.emplace_back(*resumes, "continues where the method's entry ended");
+    }
+    WriteSubmissionEntries(file, list, marks);
+    // The words of the entries from the one that left the method unfinished to the continuation.
+    const size_t first = unfinished > 0 ? unfinished - 1 : 0;
+    WriteEntryWords(file, list, first,
+                    (std::min)({entries.size() - 1, (resumes ? *resumes : index + 2) + 1,
+                                first + 23}));
+    std::fclose(file);
+    LOG_INFO(HW_GPU, "Wrote {}", path);
+}
+
+std::string DmaPusher::DescribeSubmission(const CommandList& list) const {
+    static constexpr std::array submit_kinds{"emulator-built", "SubmitGpfifo (entries in the ioctl)",
+                                             "KickoffPb (entries in guest memory)",
+                                             "SubmitGpfifo (inline input)"};
+    const u64 now = suspensions.load(std::memory_order_acquire);
+    const bool snapshot_valid =
+        (list.snapshot_suspensions & 1) == 0 && list.snapshot_suspensions == now;
+    return fmt::format(
+        "channel {}, submission {} via {}, {} entries; snapshot {} (taken at suspension count {}, "
+        "now {})",
+        channel_state.bind_id, list.submit_sequence,
+        submit_kinds[(std::min<size_t>)(list.submit_kind, submit_kinds.size() - 1)],
+        list.command_lists.size(),
+        list.submitted_offsets.empty() ? "none"
+        : snapshot_valid               ? "valid"
+                                       : "stale",
+        list.snapshot_suspensions, now);
+}
+
+void DmaPusher::WriteSubmissionEntries(std::FILE* file, const CommandList& list,
+                                       std::span<const std::pair<size_t, const char*>> marks) {
+    const auto put = [file](const std::string& line) {
+        std::fputs(line.c_str(), file);
+        std::fputc('\n', file);
+    };
+    const auto& entries = list.command_lists;
     // GPFIFO entries kicked off from guest memory: are they still what was submitted?
     if (list.gpfifo_address != 0) {
         std::vector<u64> ring(entries.size());
@@ -547,21 +596,26 @@ void DmaPusher::DumpSplitAcrossEntries(const CommandList& list, size_t index) {
         }
         const bool gpu_written = IsGpuWrittenCommands(entry.addr, size_t{entry.size} * sizeof(u32));
         std::string mark;
-        if (i == unfinished) {
-            mark = "  <- ended inside the method";
-        } else if (i == index) {
-            mark = "  <- starts elsewhere";
-        } else if (resumes && i == *resumes) {
-            mark = "  <- continues where the method's entry ended";
+        for (const auto& [marked, text] : marks) {
+            if (marked == i) {
+                mark += fmt::format("  <- {}", text);
+            }
         }
         put(fmt::format("  [{:4}] {:#018x} {:#012x} {:5} {} {} {} {:5} {}{}", i, entry.raw,
                         u64{entry.addr}, u64{entry.size}, u64{entry.is_push_buffer},
                         u64{entry.allow_flush}, u64{entry.sync}, gpu_written, words_state, mark));
     }
-    // The words of the entries from the one that left the method unfinished to the continuation.
-    const size_t first = unfinished > 0 ? unfinished - 1 : 0;
-    const size_t last = (std::min)(entries.size() - 1, (resumes ? *resumes : index + 2) + 1);
-    for (size_t i = first; i <= last && i < first + 24; ++i) {
+}
+
+void DmaPusher::WriteEntryWords(std::FILE* file, const CommandList& list, size_t first,
+                                size_t last) {
+    const auto put = [file](const std::string& line) {
+        std::fputs(line.c_str(), file);
+        std::fputc('\n', file);
+    };
+    const auto& entries = list.command_lists;
+    std::vector<u32> memory_words;
+    for (size_t i = first; i <= last && i < entries.size(); ++i) {
         const CommandListHeader& entry = entries[i];
         const size_t count = (std::min<size_t>)(entry.size, 512);
         put(fmt::format("entry {} at {:#x}, {} words{}:", i, u64{entry.addr}, u64{entry.size},
@@ -592,10 +646,51 @@ void DmaPusher::DumpSplitAcrossEntries(const CommandList& list, size_t index) {
             }
         }
     }
+}
+
+// EDEN_NX2_SPLIT_DUMP=<dir>: the first 8 impossible headers each write <dir>/nx2_misread-NN.txt:
+// the header and where it was, the last 64 headers parsed before it (how the parse got there),
+// every GP entry of the submission and the words of the 24 entries up to it and the 4 after.
+void DmaPusher::DumpMisreadSubmission(const CommandList& list, const CommandHeader& header,
+                                      size_t word_index, u32 event) {
+    const std::string path =
+        fmt::format("{}/nx2_misread-{:02}.txt", PushbufferDumpDirectory(), event);
+    std::FILE* const file = std::fopen(path.c_str(), "w");
+    if (file == nullptr) {
+        return;
+    }
+    const auto put = [file](const std::string& line) {
+        std::fputs(line.c_str(), file);
+        std::fputc('\n', file);
+    };
+    const size_t index = dma_pushbuffer_subindex;
+    put(fmt::format("misread #{}: {}", event, DescribeSubmission(list)));
+    put(fmt::format("header {:#010x} (mode {}, sub {}, method {:#x}, count {}) at word {} of "
+                    "entry {} ({:#x}, {} words); resumed at word {}",
+                    header.argument, static_cast<u32>(header.mode.Value()),
+                    header.subchannel.Value(), header.method.Value(), header.method_count.Value(),
+                    word_index, index, dma_state.dma_get,
+                    index < list.command_lists.size() ? u64{list.command_lists[index].size} : 0,
+                    command_resume_offset));
+    put(fmt::format("splits so far: {} elsewhere, {} continued in place; last unfinished entry "
+                    "ended at {:#x}",
+                    splits_elsewhere, splits_continued, split_method_end));
+    put("last headers parsed (oldest first): address word entry");
+    const u64 recorded = (std::min<u64>)(recent_header_count, recent_headers.size());
+    for (u64 i = recent_header_count - recorded; i < recent_header_count; ++i) {
+        const ParsedHeader& parsed = recent_headers[i % recent_headers.size()];
+        CommandHeader decoded{};
+        decoded.argument = parsed.word;
+        put(fmt::format("  {:#012x} {:08x} entry {:4}  mode {} sub {} method {:#x} count {}",
+                        parsed.address, parsed.word, parsed.entry,
+                        static_cast<u32>(decoded.mode.Value()), decoded.subchannel.Value(),
+                        decoded.method.Value(), decoded.method_count.Value()));
+    }
+    WriteSubmissionEntries(file, list, std::array{std::pair<size_t, const char*>{index, "misread here"}});
+    WriteEntryWords(file, list, index > 24 ? index - 24 : 0, index + 4);
     std::fclose(file);
     LOG_INFO(HW_GPU, "Wrote {}", path);
 }
-
 bool DmaPusher::GpuListStatsEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_GPU_LIST_STATS");
@@ -735,6 +830,13 @@ bool DmaPusher::IsImpossibleHostSequence(u32 first, u32 last) {
     return (first <= 1 && last >= 1) || last >= non_puller_methods;
 }
 
+bool DmaPusher::IsImpossibleEngineSequence(u32 first, u32 last, u32 run) {
+    if (last >= EngineMethodsEnd || run > MaxIncreasingRun) {
+        return true;
+    }
+    return first < MacroRegistersStart && last >= MacroRegistersStart;
+}
+
 void DmaPusher::SetState(const CommandHeader& command_header) {
     dma_state.method = command_header.method;
     dma_state.subchannel = command_header.subchannel;
@@ -743,27 +845,47 @@ void DmaPusher::SetState(const CommandHeader& command_header) {
 
 // Only a misread stream holds such a header; taken alone as one word, the parse can fall back
 // into step when the words after it are headers. The one in Kokiri Forest (Increasing, host
-// method 0, 8064 words) would have written the commands after it over every register.
-bool DmaPusher::SkipImpossibleHeader(const CommandHeader& command_header) {
+// method 0, 8064 words) would have written the commands after it over every register. Twice
+// more there, a misread stream on the 3D engine reached method 0x1a52 (past its last method)
+// and wrote the commands after it over render targets, transform feedback and constant buffers;
+// building a pipeline for the next draw then read past the transform feedback layouts.
+bool DmaPusher::SkipImpossibleHeader(const CommandHeader& command_header, size_t word_index) {
     const u32 method = command_header.method;
-    const u32 count = command_header.method_count;
-    if (method >= non_puller_methods || count == 0) {
-        return false;
+    const bool host = method < non_puller_methods;
+    bool impossible;
+    u32 count;
+    if (command_header.mode == SubmissionMode::Inline) {
+        // One write of the header's own value.
+        count = 1;
+        impossible = !host && method >= EngineMethodsEnd;
+    } else {
+        count = command_header.method_count;
+        if (count == 0) {
+            return false;
+        }
+        const bool increasing = command_header.mode == SubmissionMode::Increasing;
+        const u32 last = increasing ? method + count - 1
+                         : command_header.mode == SubmissionMode::IncreaseOnce
+                             ? method + (count > 1 ? 1 : 0)
+                             : method;
+        impossible = host ? IsImpossibleHostSequence(method, last)
+                          : IsImpossibleEngineSequence(method, last, increasing ? count : 1);
     }
-    const u32 last = command_header.mode == SubmissionMode::Increasing     ? method + count - 1
-                     : command_header.mode == SubmissionMode::IncreaseOnce ? method + (count > 1 ? 1 : 0)
-                                                                           : method;
-    if (!IsImpossibleHostSequence(method, last)) {
+    if (!impossible) {
         return false;
     }
     static std::atomic<u32> reported{};
-    if (reported.fetch_add(1) < 16) {
+    const u32 event = reported.fetch_add(1);
+    if (event < 16) {
         LOG_WARNING(HW_GPU,
-                    "Skipping impossible header {:#010x} (host method {:#x}, {} words) on ch {} "
-                    "in entry {} at {:#x} (submission {})",
-                    command_header.argument, method, count, channel_state.bind_id,
-                    dma_pushbuffer_subindex, dma_state.dma_get,
+                    "Skipping impossible header {:#010x} ({} method {:#x}, {} words) on ch {} "
+                    "in entry {} at {:#x}, word {} (submission {})",
+                    command_header.argument, host ? "host" : "engine", method, count,
+                    channel_state.bind_id, dma_pushbuffer_subindex, dma_state.dma_get, word_index,
                     dma_pushbuffer.empty() ? u64{0} : dma_pushbuffer.front().submit_sequence);
+    }
+    if (event < 8 && PushbufferDumpDirectory() != nullptr && !dma_pushbuffer.empty()) {
+        DumpMisreadSubmission(dma_pushbuffer.front(), command_header, word_index, event);
     }
     return true;
 }
