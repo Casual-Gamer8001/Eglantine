@@ -1316,6 +1316,13 @@ bool RasterizerVulkan::ReadGpuRangeForDiagnostics(GPUVAddr address, std::span<u8
     return true;
 }
 
+size_t RasterizerVulkan::DumpImagesForDiagnostics(GPUVAddr address, u32 width, u32 height,
+                                                  const std::string& directory, u64 tag) {
+    const VideoCommon::GpuSplit::BackHold hold{VideoCommon::GpuSplit::Get()};
+    std::scoped_lock lock{texture_cache.mutex};
+    return texture_cache.DumpImagesForDiagnostics(address, width, height, directory, tag);
+}
+
 void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
     if (addr == 0 || size == 0) {
         return;

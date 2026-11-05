@@ -10,6 +10,7 @@
 #include <functional>
 #include <optional>
 #include <span>
+#include <string>
 #include <utility>
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
@@ -117,6 +118,16 @@ public:
     virtual bool ReadGpuRangeForDiagnostics([[maybe_unused]] GPUVAddr address,
                                             [[maybe_unused]] std::span<u8> out) {
         return false;
+    }
+
+    /// Diagnostics (GPU thread): writes the images that start at `address` (of that size, 0 for
+    /// any) as linear texels into `directory`; returns how many were written.
+    virtual size_t DumpImagesForDiagnostics([[maybe_unused]] GPUVAddr address,
+                                            [[maybe_unused]] u32 width,
+                                            [[maybe_unused]] u32 height,
+                                            [[maybe_unused]] const std::string& directory,
+                                            [[maybe_unused]] u64 tag) {
+        return 0;
     }
 
     /// Check if the the specified memory area requires flushing to CPU Memory.

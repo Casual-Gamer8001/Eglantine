@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <type_traits>
 // TODO: find out which don't require stable iters
 #include <unordered_map>
@@ -276,6 +277,12 @@ public:
 
     /// Download contents of host images to guest memory in a region
     void DownloadMemory(DAddr cpu_addr, size_t size);
+
+    /// Diagnostics: writes the first level of each image that starts at gpu_addr (of that size,
+    /// 0 for any) as linear texels to <directory>/image-<address>-<w>x<h>-<format>-<tag>.bin.
+    /// Guest memory and the images' state are left alone. Returns how many were written.
+    size_t DumpImagesForDiagnostics(GPUVAddr gpu_addr, u32 width, u32 height,
+                                    const std::string& directory, u64 tag);
 
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr cpu_addr, u64 size);
 

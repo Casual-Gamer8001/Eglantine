@@ -9,9 +9,12 @@
 #include <algorithm>
 #include <atomic>
 #include <numeric>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <span>
+#include <string>
 #include <vector>
 #include <optional>
 #include <bit>
@@ -996,6 +999,64 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         pending.push_back(Pending{image_id, map, std::move(copies)});
     }
     flush_pending();
+}
+
+template <class P>
+size_t TextureCache<P>::DumpImagesForDiagnostics(GPUVAddr gpu_addr, u32 width, u32 height,
+                                                 const std::string& directory, u64 tag) {
+    const auto device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+    if (!device_addr) {
+        LOG_INFO(HW_GPU, "diag: {:#x} is not mapped", gpu_addr);
+        return 0;
+    }
+    boost::container::small_vector<ImageId, 8> images;
+    ForEachImageInRegion(*device_addr, 1, [&](ImageId image_id, ImageBase& image) {
+        if (image.gpu_addr == gpu_addr && (width == 0 || image.info.size.width == width) &&
+            (height == 0 || image.info.size.height == height)) {
+            images.push_back(image_id);
+        }
+    });
+    if (images.empty()) {
+        LOG_INFO(HW_GPU, "diag: no image starts at {:#x} ({}x{})", gpu_addr, width, height);
+        return 0;
+    }
+    size_t written = 0;
+    for (const ImageId image_id : images) {
+        Image& image = slot_images[image_id];
+        if (True(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels)) ||
+            image.info.num_samples != 1) {
+            LOG_INFO(HW_GPU, "diag: image at {:#x} ({}x{}, format {}) can't be read: flags {:#x}, "
+                             "{} samples",
+                     gpu_addr, image.info.size.width, image.info.size.height,
+                     static_cast<u32>(image.info.format), static_cast<u32>(image.flags),
+                     image.info.num_samples);
+            continue;
+        }
+        auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+        const auto copies = FullDownloadCopies(image.info);
+        if (copies.empty()) {
+            continue;
+        }
+        const BufferImageCopy& level0 = copies[0];
+        image.DownloadMemory(map, std::span<const BufferImageCopy>{&level0, 1});
+        runtime.Finish();
+        const std::string path =
+            fmt::format("{}/image-{:x}-{}x{}-{}-{}.bin", directory, gpu_addr,
+                        image.info.size.width, image.info.size.height,
+                        static_cast<u32>(image.info.format), tag);
+        if (std::FILE* const file = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(map.mapped_span.data() + level0.buffer_offset, 1, level0.buffer_size, file);
+            std::fclose(file);
+            ++written;
+        }
+        LOG_INFO(HW_GPU,
+                 "diag: wrote {} (format {}, row length {}, image height {}, {} layers, {} "
+                 "levels, flags {:#x})",
+                 path, static_cast<u32>(image.info.format), level0.buffer_row_length,
+                 level0.buffer_image_height, level0.image_subresource.num_layers,
+                 image.info.resources.levels, static_cast<u32>(image.flags));
+    }
+    return written;
 }
 
 template <class P>

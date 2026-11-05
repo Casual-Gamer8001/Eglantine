@@ -2100,7 +2100,10 @@ private:
     // rendered, e.g. a 3D volume, offline).
     // With EDEN_NX2_DIAG_DIR, a <dir>/dump.txt of "<hex address> <hex size>" lines does the same
     // at the next present, into <dir>/dump-<address>-<present>.bin, and is removed: render
-    // targets from a draw list can be looked at while the game runs.
+    // targets from a draw list can be looked at while the game runs. Render targets often share
+    // memory with others from the same frame, so the range holds whichever was written last: an
+    // "image <hex address> [<width> <height>]" line instead writes the texture cache's image(s)
+    // starting there, as linear texels (DumpImagesForDiagnostics).
     void DumpRanges() {
         static const std::string spec = [] {
             const char* text = std::getenv("EDEN_NX2_DUMP");
@@ -2114,6 +2117,21 @@ private:
                 std::ifstream in{request};
                 std::string line;
                 while (std::getline(in, line)) {
+                    if (line.rfind("image", 0) == 0) {
+                        char* end{};
+                        const u64 image_address = std::strtoull(line.c_str() + 5, &end, 16);
+                        const u32 image_width = static_cast<u32>(std::strtoul(end, &end, 10));
+                        const u32 image_height = static_cast<u32>(std::strtoul(end, &end, 10));
+                        if (image_address != 0) {
+                            static_cast<void>(system.GPU().RunOnGpuThread(
+                                [&system = system, image_address, image_width, image_height,
+                                 directory = dir.string(), present = m_presents] {
+                                    system.GPU().Renderer().ReadRasterizer()->DumpImagesForDiagnostics(
+                                        image_address, image_width, image_height, directory, present);
+                                }));
+                        }
+                        continue;
+                    }
                     char* end{};
                     const u64 address = std::strtoull(line.c_str(), &end, 16);
                     const u64 size = std::strtoull(end, nullptr, 16);
