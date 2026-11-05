@@ -374,7 +374,12 @@ inline void MemoryManager::MemoryOperation(GPUVAddr gpu_src_addr, std::size_t si
     while (remaining_size > 0) {
         const std::size_t copy_amount{
             (std::min)(static_cast<std::size_t>(used_page_size) - page_offset, remaining_size)};
-        auto entry = GetEntry(current_address, is_big_page);
+        // Nothing is mapped past the address space; the callbacks index the page tables with the
+        // unmasked page number, so such an address (from a misread register: Ocarina of Time's
+        // depth buffer at 0x11f4218_00010000) read far past them and crashed.
+        const auto entry = IsWithinGPUAddressRange(current_address)
+                               ? GetEntry(current_address, is_big_page)
+                               : EntryType::Free;
         if (entry == EntryType::Mapped) [[likely]] {
             if constexpr (BOOL_BREAK_MAPPED) {
                 if (func_mapped(page_index, page_offset, copy_amount)) {
@@ -668,6 +673,9 @@ void MemoryManager::CopyBlock(GPUVAddr gpu_dest_addr, GPUVAddr gpu_src_addr, std
 }
 
 bool MemoryManager::IsGranularRange(GPUVAddr gpu_addr, std::size_t size) const {
+    if (!IsWithinGPUAddressRange(gpu_addr)) [[unlikely]] {
+        return false;
+    }
     if (GetEntry(gpu_addr, true) == EntryType::Mapped) [[likely]] {
         size_t page_index = gpu_addr >> big_page_bits;
         if (IsBigPageContinuous(page_index)) [[likely]] {

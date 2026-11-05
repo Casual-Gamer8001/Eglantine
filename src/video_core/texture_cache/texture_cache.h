@@ -45,7 +45,8 @@ namespace VideoCommon {
 /// Whether a render target or texture header describes an image the host can create. Registers
 /// read while a scene changes can describe impossible ones (Ocarina of Time's Lost Woods warp:
 /// a 0x0 render target with 50,688 layers); Vulkan rejects those and the exception ended the
-/// emulator. Callers leave such images unbound.
+/// emulator. Callers leave such images unbound, and those at addresses outside the GPU's address
+/// space too (a misread command list in Kokiri Forest set one past the page tables).
 [[nodiscard]] inline bool IsPlausibleImage(const ImageInfo& info) {
     constexpr u32 MaxSize = 32768;
     constexpr u32 MaxDepth = 16384;
@@ -2097,7 +2098,8 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
         const ImageViewInfo view_info(config, 0);
         return slot_image_views.insert(runtime, info, view_info, config.Address());
     }
-    if (!IsPlausibleImage(info)) [[unlikely]] {
+    if (!IsPlausibleImage(info) || !gpu_memory->IsWithinGPUAddressRange(config.Address()))
+        [[unlikely]] {
         static std::atomic<u32> logged{};
         LogImplausibleImage(logged, "Texture", config.Address(), info);
         return NULL_IMAGE_VIEW_ID;
@@ -2937,7 +2939,7 @@ ImageViewId TextureCache<P>::FindColorBuffer(size_t index) {
         return ImageViewId{};
     }
     const ImageInfo info(regs.rt[index], regs.anti_alias_samples_mode);
-    if (!IsPlausibleImage(info)) [[unlikely]] {
+    if (!IsPlausibleImage(info) || !gpu_memory->IsWithinGPUAddressRange(gpu_addr)) [[unlikely]] {
         static std::atomic<u32> logged{};
         LogImplausibleImage(logged, "Color render target", gpu_addr, info);
         return ImageViewId{};
@@ -2956,7 +2958,7 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
         return ImageViewId{};
     }
     const ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
-    if (!IsPlausibleImage(info)) [[unlikely]] {
+    if (!IsPlausibleImage(info) || !gpu_memory->IsWithinGPUAddressRange(gpu_addr)) [[unlikely]] {
         static std::atomic<u32> logged{};
         LogImplausibleImage(logged, "Depth render target", gpu_addr, info);
         return ImageViewId{};

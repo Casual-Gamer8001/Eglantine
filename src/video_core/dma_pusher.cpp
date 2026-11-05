@@ -138,11 +138,12 @@ bool DmaPusher::Step() {
             }
         }
         if (command_resume_offset == 0) {
-            // A method's data continues across GP entries, whatever their level: title 4 ends a
-            // main entry after a macro's first word and supplies the remaining parameters in a
-            // 5-word subroutine entry. EDEN_NX2_PARK_SPLIT_METHODS restores the old guess (an
-            // entry elsewhere is a call that starts clean; resume where the split one ended).
-            static const bool park_split_methods = std::getenv("EDEN_NX2_PARK_SPLIT_METHODS") != nullptr;
+            // A method's data continues across GP entries, whatever their level, as on the
+            // hardware: title 4 ends a main entry after a macro's first word and supplies the
+            // remaining parameters in a 5-word subroutine entry. NVN also ends main entries inside
+            // a method and calls another command buffer before the rest (Ocarina of Time, Kokiri
+            // Forest: a viewport's depth range); continuing then reads the call's first words as
+            // that data and its headers out of step. ResolveSplitMethod tells the two apart.
             if (g_nx2_ampere) {
                 if (static u32 split_logs{}; dma_state.method_count != 0 && split_logs < 64) {
                     ++split_logs;
@@ -159,9 +160,7 @@ bool DmaPusher::Step() {
                     LOG_DEBUG(HW_GPU, "  previous entry ends {:08x}; next entry starts {:08x}",
                               fmt::join(prev_words, " "), fmt::join(next_words, " "));
                 }
-                if (park_split_methods) {
-                    ResolveSplitMethod(header.addr);
-                }
+                ResolveSplitMethod(command_list, dma_pushbuffer_subindex);
             }
             if (dma_pushbuffer_subindex < command_list.submit_hashes.size()) {
                 CheckSubmitHash(header, command_list.submit_hashes[dma_pushbuffer_subindex]);
@@ -327,11 +326,17 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
             // No command active - this is the first word of a new one
             switch (command_header.mode) {
             case SubmissionMode::Increasing:
+                if (SkipImpossibleHeader(command_header)) [[unlikely]] {
+                    break;
+                }
                 SetState(command_header);
                 dma_state.non_incrementing = false;
                 dma_increment_once = false;
                 break;
             case SubmissionMode::NonIncreasing:
+                if (SkipImpossibleHeader(command_header)) [[unlikely]] {
+                    break;
+                }
                 SetState(command_header);
                 dma_state.non_incrementing = true;
                 dma_increment_once = false;
@@ -345,6 +350,9 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
                 dma_increment_once = false;
                 break;
             case SubmissionMode::IncreaseOnce:
+                if (SkipImpossibleHeader(command_header)) [[unlikely]] {
+                    break;
+                }
                 SetState(command_header);
                 dma_state.non_incrementing = false;
                 dma_increment_once = true;
@@ -363,9 +371,10 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
 
 // NVN on Switch 2 ends GPFIFO entries in the middle of a method's data and calls another command
 // buffer (e.g. a compute dispatch) before the entry that carries the rest, which starts right
-// where the first one ended. An entry starting anywhere else is such a call: run it with a clean
-// method state and resume the unfinished method when the stream continues at that address.
-void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
+// where the first one ended. Such a call runs with a clean method state and the unfinished method
+// resumes when the stream continues at that address.
+void DmaPusher::ResolveSplitMethod(const CommandList& list, size_t index) {
+    const GPUVAddr entry_address = list.command_lists[index].addr;
     const auto continued = std::ranges::find(parked_methods, entry_address,
                                              &ParkedMethod::resume_address);
     std::optional<ParkedMethod> resume;
@@ -373,7 +382,8 @@ void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
         resume = *continued;
         parked_methods.erase(continued);
     }
-    if (dma_state.method_count != 0 && entry_address != split_method_end) {
+    if (dma_state.method_count != 0 && entry_address != split_method_end &&
+        ShouldParkSplitMethod(list, index)) {
         if (parked_methods.size() == MaxParkedMethods) {
             static std::atomic<u32> reported{};
             if (reported.fetch_add(1) < 8) {
@@ -405,10 +415,188 @@ void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
     }
 }
 
+// Both readings are parsed ahead, up to the entry that continues the stream where the method's
+// entry ended: the one that meets fewer instructions no driver writes wins, and a tie keeps the
+// hardware's (the data continues). In Kokiri Forest continuing left one word of a depth range to
+// be read as a header (Increasing, host method 0, 8064 words), which swept over every register
+// with the commands that followed until a draw used a depth buffer past the address space.
+// EDEN_NX2_PARK_SPLIT_METHODS=0 always continues, any other value always parks.
+bool DmaPusher::ShouldParkSplitMethod(const CommandList& list, size_t index) {
+    static const int forced = [] {
+        const char* value = std::getenv("EDEN_NX2_PARK_SPLIT_METHODS");
+        return value == nullptr ? -1 : value[0] == '0' ? 0 : 1;
+    }();
+    if (forced >= 0) {
+        return forced == 1;
+    }
+    constexpr size_t MaxLookahead = 8;     // entries searched for the continuation
+    constexpr size_t MaxCallWords = 4096;  // words read of each entry in between
+    constexpr size_t MaxResumeWords = 256; // words read of the continuation
+    const auto& entries = list.command_lists;
+    size_t resume_index = 0;
+    for (size_t i = index + 1; i < entries.size() && i <= index + MaxLookahead; ++i) {
+        if (entries[i].addr == split_method_end) {
+            resume_index = i;
+            break;
+        }
+    }
+    if (resume_index == 0) {
+        return false;
+    }
+    const SplitParseState pending{dma_state.method, dma_state.subchannel, dma_state.method_count,
+                                  dma_state.non_incrementing, dma_increment_once};
+    std::array<bool, 8> bound_continued{};
+    for (size_t i = 0; i < subchannels.size(); ++i) {
+        bound_continued[i] = subchannels[i] != nullptr;
+    }
+    std::array<bool, 8> bound_parked = bound_continued;
+    SplitParseState continued = pending;
+    SplitParseState parked{};
+    u32 continued_impossible = 0;
+    u32 parked_impossible = 0;
+    std::vector<u32> words;
+    for (size_t i = index; i < resume_index; ++i) {
+        ReadEntryWords(list, i, MaxCallWords, words);
+        continued_impossible += CountImpossibleCommands(words, continued, bound_continued);
+        parked_impossible += CountImpossibleCommands(words, parked, bound_parked);
+    }
+    // A called command buffer finishes its own methods; then the parked one resumes.
+    if (parked.method_count != 0) {
+        ++parked_impossible;
+    } else {
+        parked = pending;
+    }
+    ReadEntryWords(list, resume_index, MaxResumeWords, words);
+    continued_impossible += CountImpossibleCommands(words, continued, bound_continued);
+    parked_impossible += CountImpossibleCommands(words, parked, bound_parked);
+    const bool park = parked_impossible < continued_impossible;
+    if (static std::atomic<u32> logged{}; park && logged.fetch_add(1) < 32) {
+        LOG_INFO(HW_GPU,
+                 "Method {:#x} (sub {}, {} words left) split around a call: entry {} at {:#x} runs "
+                 "clean, the method resumes in entry {} at {:#x} (impossible instructions: {} "
+                 "continuing, {} parked)",
+                 pending.method, pending.subchannel, pending.method_count, index,
+                 u64{entries[index].addr}, resume_index, split_method_end, continued_impossible,
+                 parked_impossible);
+    }
+    return park;
+}
+
+void DmaPusher::ReadEntryWords(const CommandList& list, size_t index, size_t max_words,
+                               std::vector<u32>& words) {
+    const CommandListHeader& entry = list.command_lists[index];
+    const size_t count = (std::min<size_t>)(entry.size, max_words);
+    words.resize(count);
+    // The words as submitted, when Step would take them from there.
+    const bool snapshot = (list.snapshot_suspensions & 1) == 0 &&
+                          list.snapshot_suspensions == suspensions.load(std::memory_order_acquire);
+    if (snapshot && index < list.submitted_offsets.size()) {
+        const size_t offset = list.submitted_offsets[index];
+        if (offset + entry.size <= list.submitted_words.size()) {
+            for (size_t i = 0; i < count; ++i) {
+                words[i] = list.submitted_words[offset + i].argument;
+            }
+            return;
+        }
+    }
+    memory_manager.ReadBlockUnsafe(entry.addr, words.data(), count * sizeof(u32));
+}
+
+bool DmaPusher::IsImpossibleHostSequence(u32 first, u32 last) {
+    if (first >= non_puller_methods) {
+        return false;
+    }
+    return (first <= 1 && last >= 1) || last >= non_puller_methods;
+}
+
+u32 DmaPusher::CountImpossibleCommands(std::span<const u32> words, SplitParseState& state,
+                                       std::array<bool, 8>& bound) const {
+    u32 impossible = 0;
+    for (const u32 word : words) {
+        if (state.method_count != 0) {
+            if (state.method == static_cast<u32>(BufferMethods::BindObject)) {
+                bound[state.subchannel] = true;
+            }
+            if (!state.non_incrementing) {
+                ++state.method;
+            }
+            state.non_incrementing |= state.increment_once;
+            --state.method_count;
+            continue;
+        }
+        CommandHeader header{};
+        header.argument = word;
+        const u32 method = header.method;
+        const u32 subchannel = header.subchannel;
+        const u32 count = header.method_count;
+        switch (header.mode) {
+        case SubmissionMode::Increasing:
+        case SubmissionMode::NonIncreasing:
+        case SubmissionMode::IncreaseOnce: {
+            const bool increasing = header.mode == SubmissionMode::Increasing;
+            const bool once = header.mode == SubmissionMode::IncreaseOnce;
+            const u32 last = increasing && count != 0 ? method + count - 1
+                             : once && count > 1      ? method + 1
+                                                      : method;
+            if (count != 0 && IsImpossibleHostSequence(method, last)) {
+                ++impossible; // Step skips it as one word (SkipImpossibleHeader)
+                break;
+            }
+            if (count == 0 || (method >= non_puller_methods && !bound[subchannel])) {
+                ++impossible;
+            }
+            state = {method, subchannel, count, header.mode == SubmissionMode::NonIncreasing,
+                     once};
+            break;
+        }
+        case SubmissionMode::Inline:
+            if (IsImpossibleHostSequence(method, method) ||
+                (method >= non_puller_methods && !bound[subchannel])) {
+                ++impossible;
+            }
+            break;
+        default:
+            // The universal NOP is all zeroes; NVN writes no old-style or subdevice-mask
+            // instructions, and the remaining opcodes are reserved or end the segment.
+            if (word != 0) {
+                ++impossible;
+            }
+            break;
+        }
+    }
+    return impossible;
+}
+
 void DmaPusher::SetState(const CommandHeader& command_header) {
     dma_state.method = command_header.method;
     dma_state.subchannel = command_header.subchannel;
     dma_state.method_count = command_header.method_count;
+}
+
+// Only a misread stream holds such a header; taken alone as one word, the parse can fall back
+// into step when the words after it are headers. The one in Kokiri Forest (Increasing, host
+// method 0, 8064 words) would have written the commands after it over every register.
+bool DmaPusher::SkipImpossibleHeader(const CommandHeader& command_header) {
+    const u32 method = command_header.method;
+    const u32 count = command_header.method_count;
+    if (method >= non_puller_methods || count == 0) {
+        return false;
+    }
+    const u32 last = command_header.mode == SubmissionMode::Increasing     ? method + count - 1
+                     : command_header.mode == SubmissionMode::IncreaseOnce ? method + (count > 1 ? 1 : 0)
+                                                                           : method;
+    if (!IsImpossibleHostSequence(method, last)) {
+        return false;
+    }
+    static std::atomic<u32> reported{};
+    if (reported.fetch_add(1) < 16) {
+        LOG_WARNING(HW_GPU,
+                    "Skipping impossible header {:#010x} (host method {:#x}, {} words) on ch {} "
+                    "in the entry at {:#x}",
+                    command_header.argument, method, count, channel_state.bind_id,
+                    dma_state.dma_get);
+    }
+    return true;
 }
 
 

@@ -189,6 +189,8 @@ private:
     size_t command_resume_offset{}; ///< Words of the current entry done before a suspension
 
     void SetState(const CommandHeader& command_header);
+    /// Whether a header is one no driver writes (IsImpossibleHostSequence); logs and skips it.
+    bool SkipImpossibleHeader(const CommandHeader& command_header);
 
     void CallMethod(u32 argument);
     void CallMultiMethod(const u32* base_start, u32 num_methods);
@@ -258,8 +260,31 @@ public:
         bool increment_once;
         GPUVAddr resume_address; ///< Where the entry that continues the method starts
     };
-    void ResolveSplitMethod(GPUVAddr entry_address);
+    /// At the start of entry `index`: resumes a parked method the entry continues, and parks the
+    /// unfinished one when the entry is a call (ShouldParkSplitMethod).
+    void ResolveSplitMethod(const CommandList& list, size_t index);
+    /// Whether entry `index`, starting away from where an unfinished method's entry ended, is a
+    /// call that runs with a clean method state rather than the rest of the method's data.
+    bool ShouldParkSplitMethod(const CommandList& list, size_t index);
     static constexpr size_t MaxParkedMethods = 16;
+
+    /// Method state while ShouldParkSplitMethod reads ahead.
+    struct SplitParseState {
+        u32 method;
+        u32 subchannel;
+        u32 method_count;
+        bool non_incrementing;
+        bool increment_once;
+    };
+    /// Up to `max_words` of an entry's words, as Step would read them.
+    void ReadEntryWords(const CommandList& list, size_t index, size_t max_words,
+                        std::vector<u32>& words);
+    /// Parses words without executing them; returns how many instructions no driver writes.
+    u32 CountImpossibleCommands(std::span<const u32> words, SplitParseState& state,
+                                std::array<bool, 8>& bound) const;
+    /// Whether a header writing methods first..last is one no driver writes: host methods that
+    /// include NV_UDMA_ILLEGAL (1) or run on into the engine's methods (0x40 and up).
+    [[nodiscard]] static bool IsImpossibleHostSequence(u32 first, u32 last);
 
     // Debug aid: hashes of the words of the last entries as they were parsed.
     struct ParsedEntry {
