@@ -19,6 +19,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/nx2_events.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
@@ -63,6 +64,9 @@ Scheduler::~Scheduler() = default;
 u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
+    }
+    if (VideoCommon::Nx2Events::Enabled()) [[unlikely]] {
+        VideoCommon::Nx2Events::CountStack("Queue submissions");
     }
     // When flushing, we only send data to the worker thread; no waiting is necessary.
     const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);
@@ -135,6 +139,9 @@ bool Scheduler::WaitSubmitted(u64 tick) {
 void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
+    }
+    if (VideoCommon::Nx2Events::Enabled()) [[unlikely]] {
+        VideoCommon::Nx2Events::CountStack("Queue submissions waited for");
     }
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
@@ -511,6 +518,9 @@ void Scheduler::EndRenderPass()
         RealizeDeferredClear();
         if (!state.renderpass) {
             return;
+        }
+        if (VideoCommon::Nx2Events::Enabled()) [[unlikely]] {
+            VideoCommon::Nx2Events::CountStack("Render pass ends");
         }
 
         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);

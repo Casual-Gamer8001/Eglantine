@@ -22,6 +22,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_events.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
@@ -649,10 +650,44 @@ void Maxwell3D::ProcessQueryGet() {
 }
 
 void Maxwell3D::ProcessQueryCondition() {
+    namespace Events = VideoCommon::Nx2Events;
+    const bool count_events = Events::Enabled();
+    if (count_events) [[unlikely]] {
+        if (regs.render_enable_override != Regs::RenderEnable::Override::UseRenderEnable) {
+            Events::Count("Render enable: overridden");
+        } else {
+            switch (regs.render_enable.mode) {
+            case Regs::RenderEnable::Mode::True:
+                Events::Count("Render enable: true");
+                break;
+            case Regs::RenderEnable::Mode::False:
+                Events::Count("Render enable: false");
+                break;
+            case Regs::RenderEnable::Mode::Conditional:
+                Events::Count("Render enable: if the value is not zero");
+                break;
+            case Regs::RenderEnable::Mode::IfEqual:
+                Events::Count("Render enable: if the two values are equal");
+                break;
+            case Regs::RenderEnable::Mode::IfNotEqual:
+                Events::Count("Render enable: if the two values differ");
+                break;
+            default:
+                Events::Count("Render enable: unknown mode");
+                break;
+            }
+        }
+    }
     if (rasterizer->AccelerateConditionalRendering()) {
         execute_on = true;
         return;
     }
+    SCOPE_EXIT {
+        if (count_events) [[unlikely]] {
+            Events::Count(execute_on ? "Render enable, CPU decided: draw"
+                                     : "Render enable, CPU decided: skip");
+        }
+    };
     const GPUVAddr condition_address{regs.render_enable.Address()};
     switch (regs.render_enable_override) {
     case Regs::RenderEnable::Override::AlwaysRender:

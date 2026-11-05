@@ -18,6 +18,7 @@
 #include "common/common_types.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/nx2_events.h"
 #include "video_core/query_cache/query_cache.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -1470,6 +1471,11 @@ bool QueryCacheRuntime::HostConditionalRenderingCompareValue(VideoCommon::Lookup
     if (!impl->device.IsExtConditionalRendering()) {
         return false;
     }
+    if (VideoCommon::Nx2Events::Enabled()) [[unlikely]] {
+        VideoCommon::Nx2Events::Count(object_1.found_query != nullptr
+                                          ? "Conditional rendering, one value: query, GPU compares"
+                                          : "Conditional rendering, one value: memory, GPU compares");
+    }
     HostConditionalRenderingCompareBCImpl(object_1.address, true, true);
     return true;
 }
@@ -1480,6 +1486,12 @@ bool QueryCacheRuntime::HostConditionalRenderingCompareValues(VideoCommon::Looku
     if (!impl->device.IsExtConditionalRendering()) {
         return false;
     }
+    const bool count_events = VideoCommon::Nx2Events::Enabled();
+    const auto count = [count_events](const char* name) {
+        if (count_events) [[unlikely]] {
+            VideoCommon::Nx2Events::Count(name);
+        }
+    };
 
     const auto check_in_bc = [&](DAddr address) {
         return impl->buffer_cache.IsRegionGpuModified(address, 8);
@@ -1507,11 +1519,13 @@ bool QueryCacheRuntime::HostConditionalRenderingCompareValues(VideoCommon::Looku
     }
 
     if (!is_in_ac[0] && !is_in_ac[1]) {
+        count("Conditional rendering, two values: neither on the GPU, CPU compares");
         EndHostConditionalRendering();
         return false;
     }
 
     if (!qc_dirty && !is_in_bc[0] && !is_in_bc[1]) {
+        count("Conditional rendering, two values: queries synced, CPU compares");
         EndHostConditionalRendering();
         return false;
     }
@@ -1520,6 +1534,7 @@ bool QueryCacheRuntime::HostConditionalRenderingCompareValues(VideoCommon::Looku
     const bool is_gpu_high = Settings::IsGPULevelHigh();
 
     if ((!is_gpu_high && driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS) || driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY || driver_id == VK_DRIVER_ID_ARM_PROPRIETARY || driver_id == VK_DRIVER_ID_MESA_TURNIP) {
+        count("Conditional rendering, two values: driver, drawn always");
         EndHostConditionalRendering();
         return true;
     }
@@ -1530,6 +1545,7 @@ bool QueryCacheRuntime::HostConditionalRenderingCompareValues(VideoCommon::Looku
 
     for (size_t i = 0; i < 2; i++) {
         if (is_null[i]) {
+            count("Conditional rendering, two values: one is zero, GPU compares the other");
             size_t j = (i + 1) % 2;
             HostConditionalRenderingCompareValueImpl(*objects[j], equal_check);
             return true;
@@ -1537,14 +1553,17 @@ bool QueryCacheRuntime::HostConditionalRenderingCompareValues(VideoCommon::Looku
     }
 
     if (!is_gpu_high) {
+        count("Conditional rendering, two values: ignored at low GPU accuracy, drawn always");
         EndHostConditionalRendering();
         return true;
     }
 
     if (!is_in_bc[0] && !is_in_bc[1]) {
+        count("Conditional rendering, two values: only in the query cache, drawn always");
         EndHostConditionalRendering();
         return true;
     }
+    count("Conditional rendering, two values: GPU compares");
     HostConditionalRenderingCompareBCImpl(object_1.address, equal_check);
     return true;
 }
