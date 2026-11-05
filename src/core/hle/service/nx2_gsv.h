@@ -18,10 +18,13 @@
 #include <limits>
 #include <atomic>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <optional>
 #include <memory>
 #include <mutex>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -2095,24 +2098,52 @@ private:
     // present, flush those GPU ranges back from the host GPU and save their bytes as
     // nx2-dump-<address>.bin in the EDEN_NX2_FRAME_CAPTURE directory (to inspect what a pass
     // rendered, e.g. a 3D volume, offline).
+    // With EDEN_NX2_DIAG_DIR, a <dir>/dump.txt of "<hex address> <hex size>" lines does the same
+    // at the next present, into <dir>/dump-<address>-<present>.bin, and is removed: render
+    // targets from a draw list can be looked at while the game runs.
     void DumpRanges() {
         static const std::string spec = [] {
             const char* text = std::getenv("EDEN_NX2_DUMP");
             return text ? std::string{text} : std::string{};
         }();
-        if (spec.empty() || m_presents != std::strtoull(spec.c_str(), nullptr, 10)) {
-            return;
+        std::vector<std::tuple<u64, u64, std::string>> ranges;
+        if (const auto& dir = VideoCommon::Nx2Diag::DrawListDir(); !dir.empty()) {
+            const auto request = dir / "dump.txt";
+            std::error_code error;
+            if (std::filesystem::exists(request, error)) {
+                std::ifstream in{request};
+                std::string line;
+                while (std::getline(in, line)) {
+                    char* end{};
+                    const u64 address = std::strtoull(line.c_str(), &end, 16);
+                    const u64 size = std::strtoull(end, nullptr, 16);
+                    if (address != 0 && size != 0 && size <= (u64{256} << 20)) {
+                        ranges.emplace_back(address, size,
+                                            fmt::format("{}/dump-{:x}-{}.bin", dir.string(),
+                                                        address, m_presents));
+                    }
+                }
+                in.close();
+                std::filesystem::remove(request, error);
+            }
         }
-        const char* const directory = std::getenv("EDEN_NX2_FRAME_CAPTURE");
-        size_t position = spec.find(':');
-        while (position != std::string::npos) {
-            char* end{};
-            const u64 address = std::strtoull(spec.c_str() + position + 1, &end, 16);
-            const u64 size = *end == ':' ? std::strtoull(end + 1, &end, 16) : 0;
-            position = spec.find(',', position + 1); // the next "address:size"
-            const std::string path = fmt::format("{}/nx2-dump-{:x}.bin", directory ? directory : ".", address);
+        if (!spec.empty() && m_presents == std::strtoull(spec.c_str(), nullptr, 10)) {
+            const char* const directory = std::getenv("EDEN_NX2_FRAME_CAPTURE");
+            size_t position = spec.find(':');
+            while (position != std::string::npos) {
+                char* end{};
+                const u64 address = std::strtoull(spec.c_str() + position + 1, &end, 16);
+                const u64 size = *end == ':' ? std::strtoull(end + 1, &end, 16) : 0;
+                position = spec.find(',', position + 1); // the next "address:size"
+                ranges.emplace_back(address, size,
+                                    fmt::format("{}/nx2-dump-{:x}.bin",
+                                                directory ? directory : ".", address));
+            }
+        }
+        for (auto& [address, size, path] : ranges) {
             // On the GPU thread: waiting for it here can deadlock with a GPU wait on this present.
-            static_cast<void>(system.GPU().RunOnGpuThread([&system = system, address, size, path] {
+            static_cast<void>(system.GPU().RunOnGpuThread([&system = system, address = address,
+                                                           size = size, path = std::move(path)] {
                 std::vector<u8> bytes(size);
                 for (u64 current = address; current < address + size;) {
                     const u64 chunk = std::min((current | 0xfff) + 1, address + size) - current;
