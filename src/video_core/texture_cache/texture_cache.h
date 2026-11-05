@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <numeric>
 #include <cstdlib>
 #include <limits>
@@ -39,6 +40,38 @@ namespace VideoCommon {
 [[nodiscard]] inline bool NativeDrawDiagnostics() {
     static const bool enabled = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
     return enabled;
+}
+
+/// Whether a render target or texture header describes an image the host can create. Registers
+/// read while a scene changes can describe impossible ones (Ocarina of Time's Lost Woods warp:
+/// a 0x0 render target with 50,688 layers); Vulkan rejects those and the exception ended the
+/// emulator. Callers leave such images unbound.
+[[nodiscard]] inline bool IsPlausibleImage(const ImageInfo& info) {
+    constexpr u32 MaxSize = 32768;
+    constexpr u32 MaxDepth = 16384;
+    constexpr u32 MaxLayers = 2048;
+    if (info.size.width == 0 || info.size.height == 0 || info.size.width > MaxSize ||
+        info.size.height > MaxSize || info.resources.levels == 0) {
+        return false;
+    }
+    if (info.type == ImageType::e3D) {
+        return info.size.depth != 0 && info.size.depth <= MaxDepth;
+    }
+    return info.type == ImageType::Linear ||
+           (info.resources.layers != 0 && info.resources.layers <= MaxLayers);
+}
+
+/// Logs the first impossible images a call site met (IsPlausibleImage).
+inline void LogImplausibleImage(std::atomic<u32>& logged, const char* what, GPUVAddr gpu_addr,
+                                const ImageInfo& info) {
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_WARNING(HW_GPU,
+                    "{} at {:#x} left unbound: impossible image {}x{}x{}, {} layers, {} levels, "
+                    "type {}, format {}, layer stride {:#x}",
+                    what, gpu_addr, info.size.width, info.size.height, info.size.depth,
+                    info.resources.layers, info.resources.levels, static_cast<u32>(info.type),
+                    static_cast<u32>(info.format), info.layer_stride);
+    }
 }
 
 using Tegra::Texture::TICEntry;
@@ -2064,6 +2097,11 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
         const ImageViewInfo view_info(config, 0);
         return slot_image_views.insert(runtime, info, view_info, config.Address());
     }
+    if (!IsPlausibleImage(info)) [[unlikely]] {
+        static std::atomic<u32> logged{};
+        LogImplausibleImage(logged, "Texture", config.Address(), info);
+        return NULL_IMAGE_VIEW_ID;
+    }
     const u32 layer_offset = config.BaseLayer() * info.layer_stride;
     const GPUVAddr image_gpu_addr = config.Address() - layer_offset;
     const ImageId image_id = FindOrInsertImage(info, image_gpu_addr);
@@ -2899,6 +2937,11 @@ ImageViewId TextureCache<P>::FindColorBuffer(size_t index) {
         return ImageViewId{};
     }
     const ImageInfo info(regs.rt[index], regs.anti_alias_samples_mode);
+    if (!IsPlausibleImage(info)) [[unlikely]] {
+        static std::atomic<u32> logged{};
+        LogImplausibleImage(logged, "Color render target", gpu_addr, info);
+        return ImageViewId{};
+    }
     return FindRenderTargetView(info, gpu_addr);
 }
 
@@ -2913,6 +2956,11 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
         return ImageViewId{};
     }
     const ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
+    if (!IsPlausibleImage(info)) [[unlikely]] {
+        static std::atomic<u32> logged{};
+        LogImplausibleImage(logged, "Depth render target", gpu_addr, info);
+        return ImageViewId{};
+    }
     return FindRenderTargetView(info, gpu_addr);
 }
 
