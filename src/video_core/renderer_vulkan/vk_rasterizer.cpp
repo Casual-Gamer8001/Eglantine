@@ -521,6 +521,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         Profile::Scope scope{Profile::Zone::DrawRecord};
         draw_func();
     }
+    // Depth or stencil written in the render pass: sampling the depth buffer now needs a barrier
+    // (TextureCacheRuntime::BarrierFeedbackLoop). Depth writes need the depth test on.
+    if (const auto& regs = maxwell3d->regs;
+        (regs.depth_test_enable != 0 && regs.depth_write_enabled != 0) ||
+        regs.stencil_enable != 0) {
+        scheduler.NoteDepthStencilWrite();
+    }
     if (diag_query >= 0) {
         scheduler.Record([pool = **g_diag_pool, diag_query](vk::CommandBuffer cmdbuf) {
             cmdbuf.EndQuery(pool, static_cast<u32>(diag_query));
@@ -1121,6 +1128,11 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     if (aspect_flags == 0) {
         return;
     }
+    // A clear inside the render pass writes the attachment; a deferred one marks the pass it
+    // begins (Scheduler::RealizeDeferredClear).
+    SCOPE_EXIT {
+        scheduler.NoteDepthStencilWrite();
+    };
 
     if (use_stencil && framebuffer->HasAspectStencilBit() && regs.stencil_front_mask != 0xFF &&
         regs.stencil_front_mask != 0) {

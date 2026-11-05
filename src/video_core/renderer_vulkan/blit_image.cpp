@@ -886,6 +886,9 @@ void BlitImageHelper::BlitImpl(const Framebuffer* dst_framebuffer,
 
     RecordShaderReadBarrier(scheduler, src_image_view);
     scheduler.RequestRenderpass(dst_framebuffer);
+    if (dst_framebuffer->HasAspectDepthBit() || dst_framebuffer->HasAspectStencilBit()) {
+        scheduler.NoteDepthStencilWrite();
+    }
     scheduler.Record([this, dst_region, src_region, pipeline, layout, sampler, src_view,
                       src_stencil_view, blit_stencil](vk::CommandBuffer cmdbuf) {
         VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
@@ -1083,6 +1086,7 @@ void BlitImageHelper::ClearDepthStencil(const Framebuffer* dst_framebuffer, bool
     const VkPipeline pipeline = FindOrEmplaceClearStencilPipeline(key);
     const VkPipelineLayout layout = *clear_color_pipeline_layout;
     scheduler.RequestRenderpass(dst_framebuffer);
+    scheduler.NoteDepthStencilWrite();
     scheduler.Record([pipeline, layout, clear_depth, dst_region](vk::CommandBuffer cmdbuf) {
         constexpr std::array blend_constants{0.0f, 0.0f, 0.0f, 0.0f};
         cmdbuf.SetBlendConstants(blend_constants.data());
@@ -1321,6 +1325,9 @@ void BlitImageHelper::Convert(VkPipeline pipeline, const Framebuffer* dst_frameb
 
     RecordShaderReadBarrier(scheduler, src_image_view);
     scheduler.RequestRenderpass(dst_framebuffer);
+    if (dst_framebuffer->HasAspectDepthBit() || dst_framebuffer->HasAspectStencilBit()) {
+        scheduler.NoteDepthStencilWrite();
+    }
     scheduler.Record([pipeline, layout, sampler, src_view, extent, this](vk::CommandBuffer cmdbuf) {
         const VkOffset2D offset{
             .x = 0,
@@ -1366,6 +1373,7 @@ void BlitImageHelper::ConvertDepthStencil(VkPipeline pipeline, const Framebuffer
 
     RecordShaderReadBarrier(scheduler, src_image_view);
     scheduler.RequestRenderpass(dst_framebuffer);
+    scheduler.NoteDepthStencilWrite();
     scheduler.Record([pipeline, layout, sampler, src_depth_view, src_stencil_view, extent,
                       this](vk::CommandBuffer cmdbuf) {
         const VkOffset2D offset{

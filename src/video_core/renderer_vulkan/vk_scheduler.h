@@ -96,6 +96,17 @@ public:
         return state.renderpass != VK_NULL_HANDLE;
     }
 
+    /// Notes that the depth/stencil attachment was written (a draw with depth or stencil writes,
+    /// a clear). Until the render pass ends, sampling it needs a barrier (BarrierFeedbackLoop).
+    void NoteDepthStencilWrite() noexcept {
+        depth_stencil_written = true;
+    }
+
+    /// Whether the active render pass has written its depth/stencil attachment.
+    [[nodiscard]] bool DepthStencilWrittenInRenderPass() const noexcept {
+        return depth_stencil_written;
+    }
+
     /// Update the pipeline to the current execution context.
     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
 
@@ -366,6 +377,7 @@ private:
     u32 num_renderpass_images = 0;
     std::array<VkImage, 9> renderpass_images{};
     std::array<VkImageSubresourceRange, 9> renderpass_image_ranges{};
+    bool depth_stencil_written = false; ///< In the active render pass (NoteDepthStencilWrite)
 
     std::queue<std::unique_ptr<CommandChunk>> work_queue;
     std::vector<std::unique_ptr<CommandChunk>> chunk_reserve;

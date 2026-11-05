@@ -24,6 +24,7 @@
 
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_events.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 
 #include "video_core/engines/fermi_2d.h"
@@ -1403,7 +1404,24 @@ void TextureCacheRuntime::EraseResolveShadow(VkImage msaa_image) {
 }
 
 void TextureCacheRuntime::BarrierFeedbackLoop() {
-    scheduler.RequestOutsideRenderPassOperationContext();
+    // A draw samples the depth buffer it is bound to (soft particles, fog). What earlier passes
+    // wrote was made visible when they ended: only depth/stencil written in this render pass
+    // needs it to end first. Ending it for every such draw cost ~15,000 render passes a second in
+    // Ocarina of Time's Kokiri Forest, each with a full graphics barrier.
+    // EDEN_NX2_FEEDBACK_ALWAYS=1: end the render pass for every such draw, as before.
+    static const bool always = [] {
+        const char* const value = std::getenv("EDEN_NX2_FEEDBACK_ALWAYS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    const bool needed =
+        always || !scheduler.IsRenderPassActive() || scheduler.DepthStencilWrittenInRenderPass();
+    if (VideoCommon::Nx2Events::Enabled()) [[unlikely]] {
+        VideoCommon::Nx2Events::Count(needed ? "Feedback loop barriers"
+                                             : "Feedback loop barriers skipped (depth not written)");
+    }
+    if (needed) {
+        scheduler.RequestOutsideRenderPassOperationContext();
+    }
 }
 
 void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
