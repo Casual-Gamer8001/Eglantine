@@ -23,6 +23,7 @@
 #include "core/device_memory.h"
 #include "core/device_memory_manager.h"
 #include "core/memory.h"
+#include "core/nx2_write_trace.h"
 
 namespace Core {
 
@@ -509,6 +510,8 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_pointer, size_t size) {
+    const bool trace = Nx2WriteTrace::Enabled();
+    const u8* const src_start = static_cast<const u8*>(src_pointer);
     WalkBlock(
         address, size,
         [&](size_t copy_amount, DAddr current_vaddr) {
@@ -521,6 +524,11 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
             }
         },
         [&](size_t copy_amount, u8* const dst_ptr) {
+            if (trace) [[unlikely]] {
+                Nx2WriteTrace::Record(Nx2WriteTrace::Kind::DeviceWriteBlock,
+                                      address + (static_cast<const u8*>(src_pointer) - src_start),
+                                      dst_ptr, copy_amount);
+            }
             std::memcpy(dst_ptr, src_pointer, copy_amount);
         },
         [&](const std::size_t copy_amount) {
@@ -575,6 +583,8 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
 template <typename Traits>
 void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* src_pointer,
                                                    size_t size) {
+    const bool trace = Nx2WriteTrace::Enabled();
+    const u8* const src_start = static_cast<const u8*>(src_pointer);
     WalkBlock(
         address, size,
         [&](size_t copy_amount, DAddr current_vaddr) {
@@ -587,6 +597,11 @@ void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* sr
             }
         },
         [&](size_t copy_amount, u8* const dst_ptr) {
+            if (trace) [[unlikely]] {
+                Nx2WriteTrace::Record(Nx2WriteTrace::Kind::DeviceWriteBlockUnsafe,
+                                      address + (static_cast<const u8*>(src_pointer) - src_start),
+                                      dst_ptr, copy_amount);
+            }
             std::memcpy(dst_ptr, src_pointer, copy_amount);
         },
         [&](const std::size_t copy_amount) {

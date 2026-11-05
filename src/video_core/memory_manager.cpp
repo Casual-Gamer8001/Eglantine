@@ -12,6 +12,7 @@
 #include "core/core.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/nx2_write_trace.h"
 #include "memory_manager.h"
 #include "video_core/guest_memory.h"
 #include "video_core/nx2.h"
@@ -482,6 +483,13 @@ void MemoryManager::ReadWordsUnsafe(GPUVAddr gpu_src_addr, u32* dest, std::size_
 void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe) {
     // Give Switch 2 sparse pages the write lands on their memory first (otherwise it is dropped).
     Tegra::Nx2BackSparseWrite(gpu_dest_addr, size, src_buffer);
+    const bool trace = Core::Nx2WriteTrace::Enabled();
+    const u8* const src_start = static_cast<const u8*>(src_buffer);
+    const auto record = [&](u8* physical, std::size_t copy_amount) {
+        Core::Nx2WriteTrace::Record(Core::Nx2WriteTrace::Kind::GpuWriteBlock,
+                                    gpu_dest_addr + (static_cast<const u8*>(src_buffer) - src_start),
+                                    physical, copy_amount);
+    };
     auto just_advance = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
     };
@@ -491,6 +499,9 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
             rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
         }
         if (u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
+            if (trace) [[unlikely]] {
+                record(physical, copy_amount);
+            }
             std::memcpy(physical, src_buffer, copy_amount);
         }
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
@@ -503,6 +514,9 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
         u8* const physical = IsBigPageContinuous(page_index) ? memory.GetPointer<u8>(dev_addr_base)
                                                              : nullptr;
         if (physical != nullptr) [[likely]] {
+            if (trace) [[unlikely]] {
+                record(physical, copy_amount);
+            }
             std::memcpy(physical, src_buffer, copy_amount);
         } else {
             memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);

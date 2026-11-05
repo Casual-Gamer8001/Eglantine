@@ -1166,6 +1166,8 @@ add_library(core STATIC
     loader/xci.h
     memory.cpp
     memory.h
+    nx2_write_trace.cpp
+    nx2_write_trace.h
     memory/cheat_engine.cpp
     memory/cheat_engine.h
     memory/dmnt_cheat_types.h

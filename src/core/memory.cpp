@@ -34,6 +34,7 @@
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
+#include "core/nx2_write_trace.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
@@ -334,16 +335,25 @@ struct Memory::Impl {
     }
 
     bool WriteBlockImpl(const Common::ProcessAddress addr, const void* buffer, const std::size_t size, bool unsafe) {
+        const bool trace = Core::Nx2WriteTrace::Enabled();
         return WalkBlock(addr, size,
         [addr, size](const std::size_t offset, const std::size_t copy_amount, const Common::ProcessAddress current_vaddr) {
             LOG_ERROR(HW_Memory, "Unmapped @ {:#016x} (start address = {:#016x}, size = {})", GetInteger(current_vaddr), GetInteger(addr), size);
         },
         [&](const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
+            if (trace) [[unlikely]] {
+                Core::Nx2WriteTrace::Record(Core::Nx2WriteTrace::Kind::CpuWriteBlock,
+                                            GetInteger(addr) + offset, ptr, copy_amount);
+            }
             std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
         },
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
             if (!unsafe) {
                 HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
+            }
+            if (trace) [[unlikely]] {
+                Core::Nx2WriteTrace::Record(Core::Nx2WriteTrace::Kind::CpuWriteBlock,
+                                            GetInteger(current_vaddr), ptr, copy_amount);
             }
             std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
         });
@@ -779,6 +789,9 @@ struct Memory::Impl {
                 LOG_ERROR(HW_Memory, "Unmapped Read{} @ {:#016x} (#{})", sizeof(T) * 8, addr, count);
             }
             ++UnmappedReadFlag();
+            if (addr >= 0x10000 && Core::Nx2WriteTrace::Enabled()) [[unlikely]] {
+                Core::Nx2WriteTrace::OnGarbageAccess(addr, 0, sizeof(T), false);
+            }
         }, [&]() {
             HandleRasterizerDownload(addr, sizeof(T));
         }); ptr) [[likely]] {
@@ -800,6 +813,9 @@ struct Memory::Impl {
         const u64 addr = GetInteger(vaddr);
         if (auto const ptr = GetPointerImpl(addr, [addr, data]() {
             LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8, addr, u64(data));
+            if (addr >= 0x10000 && Core::Nx2WriteTrace::Enabled()) [[unlikely]] {
+                Core::Nx2WriteTrace::OnGarbageAccess(addr, u64(data), sizeof(T), true);
+            }
         }, [&]() { HandleRasterizerWrite(addr, sizeof(T)); }); ptr) [[likely]]
             std::memcpy(ptr, &data, sizeof(T));
     }
@@ -811,6 +827,10 @@ struct Memory::Impl {
             [vaddr, data]() {
                 LOG_ERROR(HW_Memory, "Unmapped WriteExclusive{} @ {:#016x} = {:#016x}",
                           sizeof(T) * 8, GetInteger(vaddr), static_cast<u64>(data));
+                if (GetInteger(vaddr) >= 0x10000 && Core::Nx2WriteTrace::Enabled()) [[unlikely]] {
+                    Core::Nx2WriteTrace::OnGarbageAccess(GetInteger(vaddr), static_cast<u64>(data),
+                                                         sizeof(T), true);
+                }
             },
             [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(T)); });
         if (ptr) {
