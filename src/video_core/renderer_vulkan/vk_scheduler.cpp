@@ -49,6 +49,9 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
     : device{device_}, state_tracker{state_tracker_},
       master_semaphore{std::make_unique<MasterSemaphore>(device)},
       command_pool{std::make_unique<CommandPool>(*master_semaphore, device)} {
+    if (GpuTimer::Enabled()) {
+        gpu_timer = std::make_unique<GpuTimer>(device);
+    }
 
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
@@ -192,8 +195,16 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     for (u32 i = 0; i < clear_value_count && i < values.size(); ++i) {
         values[i] = clear_values[i];
     }
-    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count](
-               vk::CommandBuffer cmdbuf) {
+    const u64 timer_label =
+        gpu_timer ? GpuTimer::RenderPassLabel(render_area.width, render_area.height,
+                                              framebuffer->NumImages(),
+                                              framebuffer->HasAspectDepthBit(), renderpass)
+                  : 0;
+    Record([this, timer_label, renderpass, framebuffer_handle, render_area, values,
+            clear_value_count](vk::CommandBuffer cmdbuf) {
+        if (gpu_timer) {
+            worker_render_pass_region = gpu_timer->Begin(cmdbuf, timer_label);
+        }
         const VkRenderPassBeginInfo renderpass_bi{
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             .pNext = nullptr,
@@ -414,6 +425,10 @@ void Scheduler::AllocateWorkerCommandBuffer() {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
         .pInheritanceInfo = nullptr,
     });
+    if (gpu_timer) {
+        worker_command_buffer_region =
+            gpu_timer->Begin(current_cmdbuf, GpuTimer::Label(GpuTimer::Kind::CommandBuffer, 0));
+    }
     current_upload_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
     current_upload_cmdbuf.Begin({
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -438,6 +453,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         };
         upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WRITE_BARRIER);
         upload_cmdbuf.End();
+        if (gpu_timer) {
+            gpu_timer->End(cmdbuf, std::exchange(worker_command_buffer_region, GpuTimer::NoRegion));
+        }
         cmdbuf.End();
 
         if (on_submit) {
@@ -461,6 +479,10 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         default:
             vk::Check(result);
             break;
+        }
+        if (gpu_timer) {
+            gpu_timer->Submitted(signal_value);
+            gpu_timer->Collect(*master_semaphore);
         }
     });
     chunk->MarkSubmit();
@@ -502,7 +524,7 @@ void Scheduler::EndRenderPass()
         query_cache->CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, false);
         query_cache->NotifySegment(false);
 
-        Record([num_images = num_renderpass_images,
+        Record([this, num_images = num_renderpass_images,
                        images = renderpass_images,
                        ranges = renderpass_image_ranges,
                        has_transform_feedback = device.IsExtTransformFeedbackSupported()](
@@ -543,6 +565,9 @@ void Scheduler::EndRenderPass()
                 };
             }
             cmdbuf.EndRenderPass();
+            if (gpu_timer) {
+                gpu_timer->End(cmdbuf, std::exchange(worker_render_pass_region, GpuTimer::NoRegion));
+            }
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
                                    0, nullptr, nullptr, vk::Span(barriers.data(), num_images));

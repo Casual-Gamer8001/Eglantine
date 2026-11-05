@@ -20,6 +20,7 @@
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
+#include "video_core/renderer_vulkan/vk_gpu_timer.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -115,6 +116,11 @@ public:
     // Registers a callback to perform on queue submission.
     void RegisterOnSubmit(std::function<void()>&& func) {
         on_submit = std::move(func);
+    }
+
+    /// EDEN_NX2_GPU_TIMESTAMPS: times work on the GPU (nullptr when off). For recorded commands.
+    [[nodiscard]] GpuTimer* GetGpuTimer() const noexcept {
+        return gpu_timer.get();
     }
 
     /// Send work to a separate thread.
@@ -340,6 +346,10 @@ private:
 
     std::unique_ptr<MasterSemaphore> master_semaphore;
     std::unique_ptr<CommandPool> command_pool;
+    /// Before worker_thread: the worker uses it until it is joined.
+    std::unique_ptr<GpuTimer> gpu_timer;
+    u32 worker_command_buffer_region = GpuTimer::NoRegion; ///< Worker thread only
+    u32 worker_render_pass_region = GpuTimer::NoRegion;    ///< Worker thread only
 
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
 

@@ -762,6 +762,13 @@ FN_MAX_LIMIT_LIST
         return features.host_query_reset.hostQueryReset != VK_FALSE;
     }
 
+    /// Nanoseconds per timestamp query tick (0 when the device has no timestamps).
+    float GetTimestampPeriod() const {
+        return properties.properties.limits.timestampComputeAndGraphics != VK_FALSE
+                   ? properties.properties.limits.timestampPeriod
+                   : 0.0f;
+    }
+
     /// Returns true if the device supports VK_EXT_transform_feedback.
     bool IsExtTransformFeedbackSupported() const {
         return extensions.transform_feedback;

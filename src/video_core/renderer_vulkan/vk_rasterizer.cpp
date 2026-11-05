@@ -1173,6 +1173,9 @@ void RasterizerVulkan::DispatchCompute() {
 
     const auto& qmd{kepler_compute->launch_description};
     auto indirect_address = kepler_compute->GetIndirectComputeAddress();
+    GpuTimer* const gpu_timer = scheduler.GetGpuTimer();
+    const u64 timer_label =
+        gpu_timer ? GpuTimer::Label(GpuTimer::Kind::Dispatch, pipeline->ShaderHash()) : 0;
     if (indirect_address) {
         // DispatchIndirect
         static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
@@ -1180,12 +1183,17 @@ void RasterizerVulkan::DispatchCompute() {
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
         scheduler.RequestOutsideRenderPassOperationContext();
-        scheduler.Record([pipeline, indirect_buffer = buffer->Handle(),
-                          indirect_offset = offset](vk::CommandBuffer cmdbuf) {
+        scheduler.Record([pipeline, indirect_buffer = buffer->Handle(), indirect_offset = offset,
+                          gpu_timer, timer_label](vk::CommandBuffer cmdbuf) {
             if (!pipeline->IsBound()) {
                 return;
             }
+            const u32 region =
+                gpu_timer ? gpu_timer->Begin(cmdbuf, timer_label) : GpuTimer::NoRegion;
             cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
+            if (gpu_timer) {
+                gpu_timer->End(cmdbuf, region);
+            }
         });
         SubmitNx2ListCopies();
         return;
@@ -1204,11 +1212,15 @@ void RasterizerVulkan::DispatchCompute() {
     };
     scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                0, READ_BARRIER); });
-    scheduler.Record([pipeline, dim](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([pipeline, dim, gpu_timer, timer_label](vk::CommandBuffer cmdbuf) {
         if (!pipeline->IsBound()) {
             return;
         }
+        const u32 region = gpu_timer ? gpu_timer->Begin(cmdbuf, timer_label) : GpuTimer::NoRegion;
         cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
+        if (gpu_timer) {
+            gpu_timer->End(cmdbuf, region);
+        }
     });
     SubmitNx2ListCopies();
 
