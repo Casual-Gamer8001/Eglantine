@@ -1008,6 +1008,10 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
                (cross_a > cross_b ? cross_a - cross_b : cross_b - cross_a) * 32 <= cross_a;
     };
     std::optional<Texture::TICEntry> input = image(0x90), output = image(0xa0);
+    // Images that rejected programs the stand-in left out would have stored to: nothing writes
+    // them. Ocarina of Time's title network ends in a program whose own input is such an image
+    // (the previous layer's output), so taking its handles copied an empty image (black title).
+    static std::unordered_set<GPUVAddr> unwritten_outputs;
     bool fortunes_weave = false;
     if (!upscale_pair(input, output)) {
         input = image(0x328);
@@ -1026,6 +1030,15 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
             for (const bool same_format : {true, false}) {
                 for (const u32 read : reads) {
                     const auto from = image(read);
+                    if (from && unwritten_outputs.contains(from->Address())) {
+                        static std::set<std::pair<GPUVAddr, GPUVAddr>> reported_unwritten;
+                        if (reported_unwritten.emplace(regs.code_loc.Address(), from->Address()).second &&
+                            reported_unwritten.size() <= 32) {
+                            LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: input {:#x} is the output of "
+                                     "a skipped program, not used", regs.code_loc.Address(), from->Address());
+                        }
+                        continue;
+                    }
                     if (upscale_pair(from, to, same_format) &&
                         (!input || u64{from->Width()} * from->Height() > u64{input->Width()} * input->Height())) {
                         input = from;
@@ -1055,6 +1068,16 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         }
     }
     const auto skip = [&](std::string_view reason) {
+        // This program's outputs stay unwritten: never take them as a stand-in input above.
+        const auto handles = NativeImageHandles(regs.code_loc.Address());
+        for (const u32 store : handles.second) {
+            if (const auto tic = image(store); tic && tic->Address() != 0) {
+                if (unwritten_outputs.size() >= 256) {
+                    unwritten_outputs.clear();
+                }
+                unwritten_outputs.insert(tic->Address());
+            }
+        }
         static std::unordered_set<GPUVAddr> reported;
         if (reported.insert(regs.code_loc.Address()).second && reported.size() <= 64) {
             LOG_INFO(HW_GPU, "Upscale fallback for program {:#x} skipped: {}", regs.code_loc.Address(),
