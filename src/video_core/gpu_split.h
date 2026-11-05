@@ -120,6 +120,34 @@ public:
     /// Waits until the back executed everything sent so far.
     void Drain();
 
+    /// Front: drains the back and keeps it from running its idle hook while this lives, so the
+    /// front can use back-owned state (the rasterizer, its caches, the Vulkan scheduler) itself.
+    /// Drain alone left the back free to run the hook, which submits deferred work
+    /// (Scheduler::FlushDeferred) as soon as another thread asks for it (WaitSubmitted, e.g. the
+    /// fencing thread): it took the command chunk the front was recording into (null chunk
+    /// crashes in the fences a semaphore acquire releases, Ocarina of Time). Taking the hold
+    /// submits that deferred work on the front, so threads waiting for it don't wait for the
+    /// held back. Send nothing to the back while holding. Nests; no-op while the split is off.
+    class [[nodiscard]] BackHold {
+    public:
+        explicit BackHold(GpuSplit& split_) : split{split_.Hold() ? &split_ : nullptr} {}
+        ~BackHold() {
+            if (split != nullptr) {
+                split->Release();
+            }
+        }
+        BackHold(const BackHold&) = delete;
+        BackHold& operator=(const BackHold&) = delete;
+
+    private:
+        GpuSplit* split;
+    };
+
+    /// Whether the calling thread holds the back (BackHold).
+    [[nodiscard]] static bool HeldByThisThread() {
+        return holding_thread;
+    }
+
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
         last_writer_position = write_position;
@@ -174,6 +202,12 @@ private:
     }
     void SwitchEngine(Tegra::Engines::EngineInterface* engine);
 
+    /// BackHold: false when there is no back to hold (split off, or called on the back).
+    bool Hold();
+    void Release();
+    /// Back: runs the idle hook unless the front holds the back (Release runs it then).
+    void RunIdleHook();
+
     void BackLoop(std::stop_token stop_token);
     size_t Execute(const u64* entry);
 
@@ -190,16 +224,23 @@ private:
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
+    u32 hold_depth{};
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};
 
     static GpuSplit instance;
     static inline thread_local bool on_back_thread{};
+    static inline thread_local bool holding_thread{};
     void (*idle_hook)(void*){};
     void* idle_argument{};
     alignas(64) std::atomic<bool> hook_requested{};
     std::atomic<bool> back_running{};
+    // BackHold handshake: the front sets `holding` then waits out a running hook; the back sets
+    // `hook_running` then skips the hook if it sees `holding` (and marks it for Release to ask).
+    alignas(64) std::atomic<bool> holding{};
+    std::atomic<bool> hook_running{};
+    std::atomic<bool> hook_skipped{};
 
     // 128 bytes: x86 spatial prefetchers pull 64-byte lines in pairs. back_waiting and wake are
     // always touched together by both threads, so they share a block.

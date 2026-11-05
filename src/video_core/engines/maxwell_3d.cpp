@@ -905,8 +905,8 @@ bool FrontSkipSame() {
 Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSplit& split) {
     if (!front) [[unlikely]] {
         // Copy the back's state and take the macros over while it is idle (state writes it
-        // still holds in its method sink first).
-        split.Drain();
+        // still holds in its method sink first; they can issue its deferred draw, so it is held).
+        const VideoCommon::GpuSplit::BackHold hold{split};
         ConsumeSink(system);
         front = std::make_unique<FrontState>();
         std::memcpy(front->regs.data(), regs.reg_array.data(), sizeof(front->regs));
@@ -1154,8 +1154,9 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                              u32 count) {
     // The words may be written by methods still queued for the back (indirect draw arguments
-    // from a culling dispatch), and the caches that may hold newer ones belong to it.
-    split.Drain();
+    // from a culling dispatch), and the caches that may hold newer ones belong to it: held while
+    // the front flushes them.
+    const VideoCommon::GpuSplit::BackHold hold{split};
     const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
     const u32 ram = fs.regs[0x156];
     const u32 words = std::min<u32>(count, 0x1000);

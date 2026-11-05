@@ -145,6 +145,9 @@ void GpuSplit::Stop() {
     front_engine = nullptr;
     back_engine = nullptr;
     front_macros = false;
+    hold_depth = 0;
+    holding.store(false, std::memory_order_relaxed);
+    hook_skipped.store(false, std::memory_order_relaxed);
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
@@ -213,6 +216,59 @@ void GpuSplit::Drain() {
             Pause();
         } else {
             std::this_thread::yield();
+        }
+    }
+}
+
+bool GpuSplit::Hold() {
+    if (on_back_thread || !active) {
+        return false;
+    }
+    if (hold_depth++ != 0) {
+        return true;
+    }
+    Drain();
+    holding.store(true, std::memory_order_seq_cst);
+    // A hook the back started before it saw the hold finishes first (RunIdleHook).
+    while (hook_running.load(std::memory_order_seq_cst)) {
+        Pause();
+    }
+    holding_thread = true;
+    // The back's deferred submissions, which its hook would make: other threads may wait for
+    // them (the fencing thread for a fence the front's ReleaseFences then waits on).
+    if (idle_hook != nullptr) {
+        idle_hook(idle_argument);
+    }
+    return true;
+}
+
+void GpuSplit::Release() {
+    if (--hold_depth != 0) {
+        return;
+    }
+    holding_thread = false;
+    holding.store(false, std::memory_order_seq_cst);
+    // A hook asked for while held runs now.
+    if (hook_skipped.exchange(false, std::memory_order_seq_cst)) {
+        RequestIdleHook();
+    }
+}
+
+void GpuSplit::RunIdleHook() {
+    for (;;) {
+        hook_running.store(true, std::memory_order_seq_cst);
+        if (!holding.load(std::memory_order_seq_cst)) {
+            idle_hook(idle_argument);
+            hook_running.store(false, std::memory_order_seq_cst);
+            return;
+        }
+        hook_skipped.store(true, std::memory_order_seq_cst);
+        hook_running.store(false, std::memory_order_seq_cst);
+        // Released in between, Release may have looked at hook_skipped before it was set: run
+        // the hook now unless Release took it.
+        if (holding.load(std::memory_order_seq_cst) ||
+            !hook_skipped.exchange(false, std::memory_order_seq_cst)) {
+            return;
         }
     }
 }
@@ -356,7 +412,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
             if (available == read_position && idle_hook != nullptr) {
                 hook_requested.store(false, std::memory_order_seq_cst);
-                idle_hook(idle_argument);
+                RunIdleHook();
                 available = published.load(std::memory_order_acquire);
             }
             if (available == read_position) {
@@ -383,7 +439,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {
                 hook_requested.store(false, std::memory_order_seq_cst);
-                idle_hook(idle_argument);
+                RunIdleHook();
             }
             // Hand ring space back now and then while working through a long batch, and at once
             // when the front waits for this position (WaitForWriters).

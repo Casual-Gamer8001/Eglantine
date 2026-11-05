@@ -97,6 +97,12 @@ bool Scheduler::WaitSubmitted(u64 tick) {
     if (IsSubmitted(tick)) {
         return true;
     }
+    // A thread holding the back (GpuSplit::BackHold) owns the scheduler meanwhile: the held
+    // back would never submit, so submit here.
+    if (VideoCommon::GpuSplit::HeldByThisThread()) {
+        Flush();
+        return true;
+    }
     auto& split = VideoCommon::GpuSplit::Get();
     split.RequestIdleHook();
     // No time limit: the back can spend seconds on one entry (a large shader's translation),
