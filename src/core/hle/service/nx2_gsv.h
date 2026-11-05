@@ -2145,13 +2145,17 @@ private:
             static_cast<void>(system.GPU().RunOnGpuThread([&system = system, address = address,
                                                            size = size, path = std::move(path)] {
                 std::vector<u8> bytes(size);
-                for (u64 current = address; current < address + size;) {
-                    const u64 chunk = std::min((current | 0xfff) + 1, address + size) - current;
-                    if (const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(current)) {
-                        system.GPU().Renderer().ReadRasterizer()->FlushRegion(*device, chunk);
-                        system.Host1x().MemoryManager().ReadBlock(*device, bytes.data() + (current - address), chunk);
+                // GPU addresses of the bound channel; else the CPU range the address space mapped.
+                if (!system.GPU().Renderer().ReadRasterizer()->ReadGpuRangeForDiagnostics(
+                        address, bytes)) {
+                    for (u64 current = address; current < address + size;) {
+                        const u64 chunk = std::min((current | 0xfff) + 1, address + size) - current;
+                        if (const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(current)) {
+                            system.GPU().Renderer().ReadRasterizer()->FlushRegion(*device, chunk);
+                            system.Host1x().MemoryManager().ReadBlock(*device, bytes.data() + (current - address), chunk);
+                        }
+                        current += chunk;
                     }
-                    current += chunk;
                 }
                 if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
                     std::fwrite(bytes.data(), 1, bytes.size(), file);

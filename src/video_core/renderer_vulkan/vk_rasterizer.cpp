@@ -1299,6 +1299,23 @@ void RasterizerVulkan::NoteGpuWrittenCommandListSynced(DAddr page) {
     buffer_cache.Nx2NoteListSynced(page);
 }
 
+bool RasterizerVulkan::ReadGpuRangeForDiagnostics(GPUVAddr address, std::span<u8> out) {
+    if (gpu_memory == nullptr) {
+        return false;
+    }
+    // The split's back owns the caches: run what the front queued and hold the back meanwhile.
+    const VideoCommon::GpuSplit::BackHold hold{VideoCommon::GpuSplit::Get()};
+    for (GPUVAddr current = address; current < address + out.size();) {
+        const u64 chunk = (std::min<u64>)((current | 0xfff) + 1, address + out.size()) - current;
+        if (const auto device_address = gpu_memory->GpuToCpuAddress(current)) {
+            FlushRegion(*device_address, chunk);
+            gpu_memory->ReadBlockUnsafe(current, out.data() + (current - address), chunk);
+        }
+        current += chunk;
+    }
+    return true;
+}
+
 void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
     if (addr == 0 || size == 0) {
         return;

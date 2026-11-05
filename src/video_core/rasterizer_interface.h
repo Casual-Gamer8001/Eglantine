@@ -112,6 +112,13 @@ public:
     /// Switch 2: the front flushed this command list page with the split drained.
     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
 
+    /// Diagnostics (GPU thread): flushes a range of the bound channel's GPU address space from the
+    /// host GPU and reads it into `out`. False when the rasterizer can't (nothing read).
+    virtual bool ReadGpuRangeForDiagnostics([[maybe_unused]] GPUVAddr address,
+                                            [[maybe_unused]] std::span<u8> out) {
+        return false;
+    }
+
     /// Check if the the specified memory area requires flushing to CPU Memory.
     virtual bool MustFlushRegion(DAddr addr, u64 size,
                                  VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
