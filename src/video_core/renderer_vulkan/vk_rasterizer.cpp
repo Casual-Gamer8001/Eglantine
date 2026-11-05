@@ -252,6 +252,9 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
 
 RasterizerVulkan::~RasterizerVulkan() {
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
+    // GPU::Impl destroys its channels before the renderer, so the bound channel's
+    // Maxwell3D may already be gone; Finish() below would write its dirty flags.
+    state_tracker.DetachChannel();
     scheduler.WaitWorker();
     scheduler.Finish();
     delete std::exchange(g_diag_pool, nullptr);
@@ -2719,6 +2722,10 @@ void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
 
 void RasterizerVulkan::ReleaseChannel(s32 channel_id) {
     EraseChannel(channel_id);
+    if (current_channel_id == UNSET_CHANNEL) {
+        // The released channel was the bound one.
+        state_tracker.DetachChannel();
+    }
     {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
         texture_cache.EraseChannel(channel_id);

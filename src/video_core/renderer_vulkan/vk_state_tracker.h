@@ -290,6 +290,9 @@ public:
 
     void ChangeChannel(Tegra::Control::ChannelState& channel_state);
 
+    /// Stops tracking the bound channel's dirty flags, e.g. before that channel is destroyed.
+    void DetachChannel();
+
     void InvalidateState();
 
 private:

@@ -261,6 +261,10 @@ void StateTracker::ChangeChannel(Tegra::Control::ChannelState& channel_state) {
     flags = &channel_state.payload->maxwell_3d.dirty.flags;
 }
 
+void StateTracker::DetachChannel() {
+    flags = &default_flags;
+}
+
 void StateTracker::InvalidateState() {
     flags->set();
     current_topology = INVALID_TOPOLOGY;
