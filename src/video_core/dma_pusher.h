@@ -8,9 +8,11 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 #include <deque>
@@ -127,6 +129,11 @@ struct CommandList final {
     /// that waited behind one, reads memory instead: games write the commands it runs before they
     /// release the acquire.
     u64 snapshot_suspensions = 0;
+    /// Where nvhost-gpu got the entries (diagnostics, DmaPusher::DumpSplitAcrossEntries).
+    u64 submit_sequence = 0;       ///< Counts guest GPFIFO submissions, all channels
+    u32 submit_kind = 0;           ///< 0 emulator-built, 1 SubmitGpfifo, 2 KickoffPb, 3 inline
+    u64 gpfifo_address = 0;        ///< KickoffPb: guest address of the entries
+    u64 gpfifo_device_address = 0; ///< ... and its device address, 0 if unknown
 };
 
 /// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).
@@ -260,28 +267,34 @@ public:
         bool increment_once;
         GPUVAddr resume_address; ///< Where the entry that continues the method starts
     };
-    /// At the start of entry `index`: resumes a parked method the entry continues, and parks the
-    /// unfinished one when the entry is a call (ShouldParkSplitMethod).
-    void ResolveSplitMethod(const CommandList& list, size_t index);
-    /// Whether entry `index`, starting away from where an unfinished method's entry ended, is a
-    /// call that runs with a clean method state rather than the rest of the method's data.
-    bool ShouldParkSplitMethod(const CommandList& list, size_t index);
+    void ResolveSplitMethod(GPUVAddr entry_address);
     static constexpr size_t MaxParkedMethods = 16;
+    /// An entry starts away from where an unfinished method's entry ended: log it and, with
+    /// EDEN_NX2_SPLIT_DUMP, write the submission around it out.
+    void DumpSplitAcrossEntries(const CommandList& list, size_t index);
+    u64 splits_continued{}; ///< Unfinished methods the next entry continued in place
+    u64 splits_elsewhere{}; ///< ... whose next entry started elsewhere
 
-    /// Method state while ShouldParkSplitMethod reads ahead.
-    struct SplitParseState {
-        u32 method;
-        u32 subchannel;
-        u32 method_count;
-        bool non_incrementing;
-        bool increment_once;
+    /// EDEN_NX2_GPU_LIST_STATS=1 (diagnostics): how command lists the GPU writes were read.
+    [[nodiscard]] static bool GpuListStatsEnabled();
+    void NoteGpuWrittenList(GPUVAddr address, std::span<const CommandHeader> words, bool flushed,
+                            std::chrono::steady_clock::duration took);
+    struct GpuListStats {
+        u64 reads;
+        u64 flushed;
+        u64 slow;
+        u64 read_ns;
+        u64 max_ns;
+        u64 words;
+        u64 first;
+        u64 resized;
+        u64 unchanged;
+        u64 data_changed;
+        u64 headers_changed;
     };
-    /// Up to `max_words` of an entry's words, as Step would read them.
-    void ReadEntryWords(const CommandList& list, size_t index, size_t max_words,
-                        std::vector<u32>& words);
-    /// Parses words without executing them; returns how many instructions no driver writes.
-    u32 CountImpossibleCommands(std::span<const u32> words, SplitParseState& state,
-                                std::array<bool, 8>& bound) const;
+    GpuListStats gpu_list_stats{};
+    std::chrono::steady_clock::time_point gpu_list_stats_since{};
+    std::unordered_map<GPUVAddr, std::vector<u32>> gpu_list_history; ///< Last words read per list
     /// Whether a header writing methods first..last is one no driver writes: host methods that
     /// include NV_UDMA_ILLEGAL (1) or run on into the engine's methods (0x40 and up).
     [[nodiscard]] static bool IsImpossibleHostSequence(u32 first, u32 last);

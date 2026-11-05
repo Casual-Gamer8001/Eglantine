@@ -140,27 +140,28 @@ bool DmaPusher::Step() {
         if (command_resume_offset == 0) {
             // A method's data continues across GP entries, whatever their level, as on the
             // hardware: title 4 ends a main entry after a macro's first word and supplies the
-            // remaining parameters in a 5-word subroutine entry. NVN also ends main entries inside
-            // a method and calls another command buffer before the rest (Ocarina of Time, Kokiri
-            // Forest: a viewport's depth range); continuing then reads the call's first words as
-            // that data and its headers out of step. ResolveSplitMethod tells the two apart.
+            // remaining parameters in a 5-word subroutine entry. Ocarina of Time also has entries
+            // that start elsewhere between a method's first words and the rest (Kokiri Forest:
+            // a viewport's depth range), which the hardware could not run either; those are
+            // counted and, with EDEN_NX2_SPLIT_DUMP, written out (DumpSplitAcrossEntries).
+            // EDEN_NX2_PARK_SPLIT_METHODS=1 restores the old guess (an entry elsewhere is a call
+            // that starts clean; the method resumes where its entry ended).
+            static const bool park_split_methods = [] {
+                const char* value = std::getenv("EDEN_NX2_PARK_SPLIT_METHODS");
+                return value != nullptr && value[0] != '\0' && value[0] != '0';
+            }();
             if (g_nx2_ampere) {
-                if (static u32 split_logs{}; dma_state.method_count != 0 && split_logs < 64) {
-                    ++split_logs;
-                    LOG_DEBUG(HW_GPU, "Split method {:#x} ({} left) on ch {}: next entry {:#x} size {} raw {:#x} (level bit {}, priv bit {}), expected {:#x}, parked {}",
-                             dma_state.method, dma_state.method_count, channel_state.bind_id,
-                             u64{header.addr}, u64{header.size}, header.raw, u64{header.is_push_buffer},
-                             u64{header.allow_flush}, split_method_end, parked_methods.size());
-                    std::array<u32, 8> next_words{};
-                    std::array<u32, 4> prev_words{};
-                    memory_manager.ReadBlockUnsafe(header.addr, next_words.data(),
-                                             std::min<size_t>(header.size, 8) * sizeof(u32));
-                    memory_manager.ReadBlockUnsafe(split_method_end - sizeof(prev_words), prev_words.data(),
-                                             sizeof(prev_words));
-                    LOG_DEBUG(HW_GPU, "  previous entry ends {:08x}; next entry starts {:08x}",
-                              fmt::join(prev_words, " "), fmt::join(next_words, " "));
+                if (dma_state.method_count != 0) {
+                    if (u64{header.addr} == split_method_end) {
+                        ++splits_continued;
+                    } else {
+                        ++splits_elsewhere;
+                        DumpSplitAcrossEntries(command_list, dma_pushbuffer_subindex);
+                    }
                 }
-                ResolveSplitMethod(command_list, dma_pushbuffer_subindex);
+                if (park_split_methods) {
+                    ResolveSplitMethod(header.addr);
+                }
             }
             if (dma_pushbuffer_subindex < command_list.submit_hashes.size()) {
                 CheckSubmitHash(header, command_list.submit_hashes[dma_pushbuffer_subindex]);
@@ -207,8 +208,15 @@ bool DmaPusher::Step() {
             RecordParsedEntry(header, commands);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
-        } else if (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
+        } else if (const auto read_start = GpuListStatsEnabled() && gpu_written
+                                               ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
+                   ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
+            if (read_start != std::chrono::steady_clock::time_point{}) {
+                NoteGpuWrittenList(dma_state.dma_get, commands, false,
+                                   std::chrono::steady_clock::now() - read_start);
+            }
             RecordParsedEntry(header, commands);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
@@ -216,6 +224,10 @@ bool DmaPusher::Step() {
             FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
+            if (read_start != std::chrono::steady_clock::time_point{}) {
+                NoteGpuWrittenList(dma_state.dma_get, commands, true,
+                                   std::chrono::steady_clock::now() - read_start);
+            }
             RecordParsedEntry(header, commands);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
@@ -371,10 +383,9 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
 
 // NVN on Switch 2 ends GPFIFO entries in the middle of a method's data and calls another command
 // buffer (e.g. a compute dispatch) before the entry that carries the rest, which starts right
-// where the first one ended. Such a call runs with a clean method state and the unfinished method
-// resumes when the stream continues at that address.
-void DmaPusher::ResolveSplitMethod(const CommandList& list, size_t index) {
-    const GPUVAddr entry_address = list.command_lists[index].addr;
+// where the first one ended. An entry starting anywhere else is such a call: run it with a clean
+// method state and resume the unfinished method when the stream continues at that address.
+void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
     const auto continued = std::ranges::find(parked_methods, entry_address,
                                              &ParkedMethod::resume_address);
     std::optional<ParkedMethod> resume;
@@ -382,8 +393,7 @@ void DmaPusher::ResolveSplitMethod(const CommandList& list, size_t index) {
         resume = *continued;
         parked_methods.erase(continued);
     }
-    if (dma_state.method_count != 0 && entry_address != split_method_end &&
-        ShouldParkSplitMethod(list, index)) {
+    if (dma_state.method_count != 0 && entry_address != split_method_end) {
         if (parked_methods.size() == MaxParkedMethods) {
             static std::atomic<u32> reported{};
             if (reported.fetch_add(1) < 8) {
@@ -415,91 +425,307 @@ void DmaPusher::ResolveSplitMethod(const CommandList& list, size_t index) {
     }
 }
 
-// Both readings are parsed ahead, up to the entry that continues the stream where the method's
-// entry ended: the one that meets fewer instructions no driver writes wins, and a tie keeps the
-// hardware's (the data continues). In Kokiri Forest continuing left one word of a depth range to
-// be read as a header (Increasing, host method 0, 8064 words), which swept over every register
-// with the commands that followed until a draw used a depth buffer past the address space.
-// EDEN_NX2_PARK_SPLIT_METHODS=0 always continues, any other value always parks.
-bool DmaPusher::ShouldParkSplitMethod(const CommandList& list, size_t index) {
-    static const int forced = [] {
-        const char* value = std::getenv("EDEN_NX2_PARK_SPLIT_METHODS");
-        return value == nullptr ? -1 : value[0] == '0' ? 0 : 1;
-    }();
-    if (forced >= 0) {
-        return forced == 1;
-    }
-    constexpr size_t MaxLookahead = 8;     // entries searched for the continuation
-    constexpr size_t MaxCallWords = 4096;  // words read of each entry in between
-    constexpr size_t MaxResumeWords = 256; // words read of the continuation
+// An entry starts away from where the unfinished method's entry ended. The hardware continues the
+// method's data into it all the same, so a driver never submits that unless the entry holds the
+// data (title 4's macro parameters). The first ones are logged; EDEN_NX2_SPLIT_DUMP=<dir> also
+// writes the submission around each of the first 16 as <dir>/nx2_split-NN.txt: every GP entry
+// (raw, level, privilege and sync bits, whether the GPU writes its pages, whether its words
+// changed since they were submitted), the words of the entries around the split as submitted and
+// as in memory now, and for kicked-off submissions whether the GPFIFO entries in guest memory
+// still match the ones submitted.
+void DmaPusher::DumpSplitAcrossEntries(const CommandList& list, size_t index) {
     const auto& entries = list.command_lists;
-    size_t resume_index = 0;
-    for (size_t i = index + 1; i < entries.size() && i <= index + MaxLookahead; ++i) {
-        if (entries[i].addr == split_method_end) {
-            resume_index = i;
+    const CommandListHeader& current = entries[index];
+    static std::atomic<u32> events{};
+    const u32 event = events.fetch_add(1, std::memory_order_relaxed);
+    if (event < 64) {
+        LOG_INFO(HW_GPU,
+                 "Method {:#x} (sub {}, {} words left) unfinished at entry {} of {} (submission "
+                 "{}, ch {}), which starts at {:#x}, not where the method's entry ended ({:#x}); "
+                 "{} such splits, {} continued in place",
+                 dma_state.method, dma_state.subchannel, dma_state.method_count, index,
+                 entries.size(), list.submit_sequence, channel_state.bind_id, u64{current.addr},
+                 split_method_end, splits_elsewhere, splits_continued);
+    }
+    static const char* const directory = std::getenv("EDEN_NX2_SPLIT_DUMP");
+    if (directory == nullptr || event >= 16) {
+        return;
+    }
+    const std::string path = fmt::format("{}/nx2_split-{:02}.txt", directory, event);
+    std::FILE* const file = std::fopen(path.c_str(), "w");
+    if (file == nullptr) {
+        return;
+    }
+    const auto put = [file](const std::string& line) {
+        std::fputs(line.c_str(), file);
+        std::fputc('\n', file);
+    };
+    // The entry whose end left the method unfinished, and the first one after that continues there.
+    size_t unfinished = index > 0 ? index - 1 : 0;
+    for (size_t i = index; i-- > 0;) {
+        if (u64{entries[i].addr} + u64{entries[i].size} * sizeof(u32) == split_method_end) {
+            unfinished = i;
             break;
         }
     }
-    if (resume_index == 0) {
-        return false;
-    }
-    const SplitParseState pending{dma_state.method, dma_state.subchannel, dma_state.method_count,
-                                  dma_state.non_incrementing, dma_increment_once};
-    std::array<bool, 8> bound_continued{};
-    for (size_t i = 0; i < subchannels.size(); ++i) {
-        bound_continued[i] = subchannels[i] != nullptr;
-    }
-    std::array<bool, 8> bound_parked = bound_continued;
-    SplitParseState continued = pending;
-    SplitParseState parked{};
-    u32 continued_impossible = 0;
-    u32 parked_impossible = 0;
-    std::vector<u32> words;
-    for (size_t i = index; i < resume_index; ++i) {
-        ReadEntryWords(list, i, MaxCallWords, words);
-        continued_impossible += CountImpossibleCommands(words, continued, bound_continued);
-        parked_impossible += CountImpossibleCommands(words, parked, bound_parked);
-    }
-    // A called command buffer finishes its own methods; then the parked one resumes.
-    if (parked.method_count != 0) {
-        ++parked_impossible;
-    } else {
-        parked = pending;
-    }
-    ReadEntryWords(list, resume_index, MaxResumeWords, words);
-    continued_impossible += CountImpossibleCommands(words, continued, bound_continued);
-    parked_impossible += CountImpossibleCommands(words, parked, bound_parked);
-    const bool park = parked_impossible < continued_impossible;
-    if (static std::atomic<u32> logged{}; park && logged.fetch_add(1) < 32) {
-        LOG_INFO(HW_GPU,
-                 "Method {:#x} (sub {}, {} words left) split around a call: entry {} at {:#x} runs "
-                 "clean, the method resumes in entry {} at {:#x} (impossible instructions: {} "
-                 "continuing, {} parked)",
-                 pending.method, pending.subchannel, pending.method_count, index,
-                 u64{entries[index].addr}, resume_index, split_method_end, continued_impossible,
-                 parked_impossible);
-    }
-    return park;
-}
-
-void DmaPusher::ReadEntryWords(const CommandList& list, size_t index, size_t max_words,
-                               std::vector<u32>& words) {
-    const CommandListHeader& entry = list.command_lists[index];
-    const size_t count = (std::min<size_t>)(entry.size, max_words);
-    words.resize(count);
-    // The words as submitted, when Step would take them from there.
-    const bool snapshot = (list.snapshot_suspensions & 1) == 0 &&
-                          list.snapshot_suspensions == suspensions.load(std::memory_order_acquire);
-    if (snapshot && index < list.submitted_offsets.size()) {
-        const size_t offset = list.submitted_offsets[index];
-        if (offset + entry.size <= list.submitted_words.size()) {
-            for (size_t i = 0; i < count; ++i) {
-                words[i] = list.submitted_words[offset + i].argument;
-            }
-            return;
+    std::optional<size_t> resumes;
+    for (size_t i = index + 1; i < entries.size() && i <= index + 64; ++i) {
+        if (u64{entries[i].addr} == split_method_end) {
+            resumes = i;
+            break;
         }
     }
-    memory_manager.ReadBlockUnsafe(entry.addr, words.data(), count * sizeof(u32));
+    static constexpr std::array submit_kinds{"emulator-built", "SubmitGpfifo (entries in the ioctl)",
+                                             "KickoffPb (entries in guest memory)",
+                                             "SubmitGpfifo (inline input)"};
+    const bool snapshot_valid =
+        (list.snapshot_suspensions & 1) == 0 &&
+        list.snapshot_suspensions == suspensions.load(std::memory_order_acquire);
+    put(fmt::format("split #{}: channel {}, submission {} via {}, {} entries", event,
+                    channel_state.bind_id, list.submit_sequence,
+                    submit_kinds[(std::min<size_t>)(list.submit_kind, submit_kinds.size() - 1)],
+                    entries.size()));
+    put(fmt::format("pending: method {:#x} sub {} count {} non_incrementing {} increment_once {}",
+                    dma_state.method, dma_state.subchannel, dma_state.method_count,
+                    dma_state.non_incrementing, static_cast<bool>(dma_increment_once)));
+    put(fmt::format("the method's entry {} ended at {:#x}; entry {} starts at {:#x}; {}",
+                    unfinished, split_method_end, index, u64{current.addr},
+                    resumes ? fmt::format("entry {} continues at {:#x}", *resumes, split_method_end)
+                            : std::string{"no later entry continues there"}));
+    put(fmt::format("snapshot: {} (taken at suspension count {}, now {})",
+                    list.submitted_offsets.empty() ? "none"
+                    : snapshot_valid               ? "valid"
+                                                   : "stale",
+                    list.snapshot_suspensions, suspensions.load(std::memory_order_acquire)));
+    put(fmt::format("splits so far: {} elsewhere, {} continued in place", splits_elsewhere,
+                    splits_continued));
+    // GPFIFO entries kicked off from guest memory: are they still what was submitted?
+    if (list.gpfifo_address != 0) {
+        std::vector<u64> ring(entries.size());
+        system.ApplicationMemory().ReadBlock(list.gpfifo_address, ring.data(),
+                                             ring.size() * sizeof(u64));
+        size_t changed = 0;
+        std::string first_changes;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (ring[i] != entries[i].raw) {
+                if (++changed <= 16) {
+                    first_changes += fmt::format(" [{}] {:#018x}->{:#018x}", i, entries[i].raw, ring[i]);
+                }
+            }
+        }
+        bool ring_gpu_written = false;
+        if (list.gpfifo_device_address != 0) {
+            const u64 bytes = entries.size() * sizeof(u64);
+            for (u64 page = list.gpfifo_device_address & ~u64{0xfff};
+                 page < list.gpfifo_device_address + bytes; page += 0x1000) {
+                ring_gpu_written |= Nx2IsGpuWritten(page);
+            }
+        }
+        put(fmt::format("GPFIFO at {:#x} (device {:#x}, GPU writes its pages: {}): {} of {} entries "
+                        "differ in guest memory now{}",
+                        list.gpfifo_address, list.gpfifo_device_address, ring_gpu_written, changed,
+                        entries.size(), first_changes));
+    }
+    // Every GP entry. "words" compares the submitted copy with guest memory now.
+    put("GP entries: index raw address words level(1=subroutine) priv sync gpu-written words");
+    std::vector<u32> memory_words;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const CommandListHeader& entry = entries[i];
+        std::string words_state = "-";
+        if (i < list.submitted_offsets.size() && entry.size <= 0x10000 &&
+            list.submitted_offsets[i] + entry.size <= list.submitted_words.size()) {
+            memory_words.resize(entry.size);
+            memory_manager.ReadBlockUnsafe(entry.addr, memory_words.data(),
+                                           memory_words.size() * sizeof(u32));
+            const auto* submitted = list.submitted_words.data() + list.submitted_offsets[i];
+            words_state = std::equal(memory_words.begin(), memory_words.end(), submitted,
+                                     [](u32 word, const CommandHeader& header) {
+                                         return word == header.argument;
+                                     })
+                              ? "same"
+                              : "CHANGED";
+        }
+        const bool gpu_written = IsGpuWrittenCommands(entry.addr, size_t{entry.size} * sizeof(u32));
+        std::string mark;
+        if (i == unfinished) {
+            mark = "  <- ended inside the method";
+        } else if (i == index) {
+            mark = "  <- starts elsewhere";
+        } else if (resumes && i == *resumes) {
+            mark = "  <- continues where the method's entry ended";
+        }
+        put(fmt::format("  [{:4}] {:#018x} {:#012x} {:5} {} {} {} {:5} {}{}", i, entry.raw,
+                        u64{entry.addr}, u64{entry.size}, u64{entry.is_push_buffer},
+                        u64{entry.allow_flush}, u64{entry.sync}, gpu_written, words_state, mark));
+    }
+    // The words of the entries from the one that left the method unfinished to the continuation.
+    const size_t first = unfinished > 0 ? unfinished - 1 : 0;
+    const size_t last = (std::min)(entries.size() - 1, (resumes ? *resumes : index + 2) + 1);
+    for (size_t i = first; i <= last && i < first + 24; ++i) {
+        const CommandListHeader& entry = entries[i];
+        const size_t count = (std::min<size_t>)(entry.size, 512);
+        put(fmt::format("entry {} at {:#x}, {} words{}:", i, u64{entry.addr}, u64{entry.size},
+                        count < entry.size ? " (first 512)" : ""));
+        memory_words.resize(count);
+        memory_manager.ReadBlockUnsafe(entry.addr, memory_words.data(), count * sizeof(u32));
+        const bool has_submitted = i < list.submitted_offsets.size() &&
+                                   list.submitted_offsets[i] + entry.size <=
+                                       list.submitted_words.size();
+        for (size_t word = 0; word < count; word += 8) {
+            std::string submitted_line;
+            std::string memory_line;
+            for (size_t j = word; j < (std::min)(count, word + 8); ++j) {
+                const u32 now = memory_words[j];
+                if (has_submitted) {
+                    const u32 then = list.submitted_words[list.submitted_offsets[i] + j].argument;
+                    submitted_line += fmt::format(" {:08x}", then);
+                    memory_line += then == now ? std::string(" ........") : fmt::format(" {:08x}", now);
+                } else {
+                    memory_line += fmt::format(" {:08x}", now);
+                }
+            }
+            if (has_submitted) {
+                put(fmt::format("  +{:03x} submitted:{}", word * 4, submitted_line));
+                put(fmt::format("       memory   :{}", memory_line));
+            } else {
+                put(fmt::format("  +{:03x} memory:{}", word * 4, memory_line));
+            }
+        }
+    }
+    std::fclose(file);
+    LOG_INFO(HW_GPU, "Wrote {}", path);
+}
+
+bool DmaPusher::GpuListStatsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_GPU_LIST_STATS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+namespace {
+/// Which words of a command list are instructions, parsing it from a clean method state.
+void MarkInstructions(std::span<const u32> words, std::vector<bool>& instructions) {
+    instructions.assign(words.size(), false);
+    u32 data_left = 0;
+    for (size_t i = 0; i < words.size(); ++i) {
+        if (data_left != 0) {
+            --data_left;
+            continue;
+        }
+        instructions[i] = true;
+        CommandHeader header{};
+        header.argument = words[i];
+        if (header.mode == SubmissionMode::Increasing ||
+            header.mode == SubmissionMode::NonIncreasing ||
+            header.mode == SubmissionMode::IncreaseOnce) {
+            data_left = header.method_count;
+        }
+    }
+}
+} // Anonymous namespace
+
+// EDEN_NX2_GPU_LIST_STATS=1: every 10 s, how the GPU thread read the command lists the GPU writes
+// (from the copy the buffer cache made, after waiting for it, or through a cache flush), the time
+// that took, and what changed since the same list was last read: nothing, only method data (the
+// arguments the culling fills in) or instructions too. With EDEN_NX2_SPLIT_DUMP=<dir>, the first
+// changes of each kind are written to <dir>/nx2_gpulist-{data,instructions}-N.txt.
+void DmaPusher::NoteGpuWrittenList(GPUVAddr address, std::span<const CommandHeader> words,
+                                   bool flushed, std::chrono::steady_clock::duration took) {
+    auto& stats = gpu_list_stats;
+    const u64 ns =
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(took).count());
+    ++stats.reads;
+    stats.flushed += flushed ? 1 : 0;
+    stats.slow += ns >= 100'000 ? 1 : 0;
+    stats.read_ns += ns;
+    stats.max_ns = (std::max)(stats.max_ns, ns);
+    stats.words += words.size();
+    if (gpu_list_history.size() >= 8192) {
+        gpu_list_history.clear();
+    }
+    std::vector<u32>& last = gpu_list_history[address];
+    std::vector<u32> now(words.size());
+    for (size_t i = 0; i < words.size(); ++i) {
+        now[i] = words[i].argument;
+    }
+    if (last.empty()) {
+        ++stats.first;
+    } else if (last.size() != now.size()) {
+        ++stats.resized;
+    } else {
+        std::vector<bool> old_instructions;
+        std::vector<bool> new_instructions;
+        MarkInstructions(last, old_instructions);
+        MarkInstructions(now, new_instructions);
+        bool data_changed = false;
+        bool instructions_changed = false;
+        for (size_t i = 0; i < now.size(); ++i) {
+            if (now[i] == last[i] && old_instructions[i] == new_instructions[i]) {
+                continue;
+            }
+            if (old_instructions[i] || new_instructions[i]) {
+                instructions_changed = true;
+            } else {
+                data_changed = true;
+            }
+        }
+        if (instructions_changed) {
+            ++stats.headers_changed;
+        } else if (data_changed) {
+            ++stats.data_changed;
+        } else {
+            ++stats.unchanged;
+        }
+        static const char* const directory = std::getenv("EDEN_NX2_SPLIT_DUMP");
+        static std::atomic<u32> data_dumps{};
+        static std::atomic<u32> instruction_dumps{};
+        if (directory != nullptr && (instructions_changed || data_changed)) {
+            const u32 number = (instructions_changed ? instruction_dumps : data_dumps).fetch_add(1);
+            if (number < 6) {
+                const std::string path =
+                    fmt::format("{}/nx2_gpulist-{}-{}.txt", directory,
+                                instructions_changed ? "instructions" : "data", number);
+                if (std::FILE* const file = std::fopen(path.c_str(), "w")) {
+                    std::fputs(fmt::format("list at {:#x}, {} words, read {} in {} us\n", address,
+                                           now.size(), flushed ? "through a flush" : "from a copy",
+                                           ns / 1000)
+                                   .c_str(),
+                               file);
+                    std::fputs("word: before -> now (I = instruction, . = data)\n", file);
+                    for (size_t i = 0; i < (std::min<size_t>)(now.size(), 2048); ++i) {
+                        std::fputs(fmt::format("  {:4}: {:08x} {} -> {:08x} {}{}\n", i, last[i],
+                                               old_instructions[i] ? 'I' : '.', now[i],
+                                               new_instructions[i] ? 'I' : '.',
+                                               last[i] != now[i] ? "  *" : "")
+                                       .c_str(),
+                                   file);
+                    }
+                    std::fclose(file);
+                }
+            }
+        }
+    }
+    last = std::move(now);
+    const auto current = std::chrono::steady_clock::now();
+    if (gpu_list_stats_since == std::chrono::steady_clock::time_point{}) {
+        gpu_list_stats_since = current;
+    }
+    const double seconds = std::chrono::duration<double>(current - gpu_list_stats_since).count();
+    if (seconds >= 10.0) {
+        LOG_INFO(HW_GPU,
+                 "GPU-written command lists in the last {:.1f} s: {} read ({} words), {} through a "
+                 "cache flush, {} took over 0.1 ms; {:.1f} ms reading, longest {:.2f} ms. Since "
+                 "their last read: {} new, {} resized, {} unchanged, {} only data changed, {} "
+                 "instructions changed",
+                 seconds, stats.reads, stats.words, stats.flushed, stats.slow,
+                 static_cast<double>(stats.read_ns) / 1e6, static_cast<double>(stats.max_ns) / 1e6,
+                 stats.first, stats.resized, stats.unchanged, stats.data_changed,
+                 stats.headers_changed);
+        stats = {};
+        gpu_list_stats_since = current;
+    }
 }
 
 bool DmaPusher::IsImpossibleHostSequence(u32 first, u32 last) {
@@ -507,64 +733,6 @@ bool DmaPusher::IsImpossibleHostSequence(u32 first, u32 last) {
         return false;
     }
     return (first <= 1 && last >= 1) || last >= non_puller_methods;
-}
-
-u32 DmaPusher::CountImpossibleCommands(std::span<const u32> words, SplitParseState& state,
-                                       std::array<bool, 8>& bound) const {
-    u32 impossible = 0;
-    for (const u32 word : words) {
-        if (state.method_count != 0) {
-            if (state.method == static_cast<u32>(BufferMethods::BindObject)) {
-                bound[state.subchannel] = true;
-            }
-            if (!state.non_incrementing) {
-                ++state.method;
-            }
-            state.non_incrementing |= state.increment_once;
-            --state.method_count;
-            continue;
-        }
-        CommandHeader header{};
-        header.argument = word;
-        const u32 method = header.method;
-        const u32 subchannel = header.subchannel;
-        const u32 count = header.method_count;
-        switch (header.mode) {
-        case SubmissionMode::Increasing:
-        case SubmissionMode::NonIncreasing:
-        case SubmissionMode::IncreaseOnce: {
-            const bool increasing = header.mode == SubmissionMode::Increasing;
-            const bool once = header.mode == SubmissionMode::IncreaseOnce;
-            const u32 last = increasing && count != 0 ? method + count - 1
-                             : once && count > 1      ? method + 1
-                                                      : method;
-            if (count != 0 && IsImpossibleHostSequence(method, last)) {
-                ++impossible; // Step skips it as one word (SkipImpossibleHeader)
-                break;
-            }
-            if (count == 0 || (method >= non_puller_methods && !bound[subchannel])) {
-                ++impossible;
-            }
-            state = {method, subchannel, count, header.mode == SubmissionMode::NonIncreasing,
-                     once};
-            break;
-        }
-        case SubmissionMode::Inline:
-            if (IsImpossibleHostSequence(method, method) ||
-                (method >= non_puller_methods && !bound[subchannel])) {
-                ++impossible;
-            }
-            break;
-        default:
-            // The universal NOP is all zeroes; NVN writes no old-style or subdevice-mask
-            // instructions, and the remaining opcodes are reserved or end the segment.
-            if (word != 0) {
-                ++impossible;
-            }
-            break;
-        }
-    }
-    return impossible;
 }
 
 void DmaPusher::SetState(const CommandHeader& command_header) {
@@ -592,9 +760,10 @@ bool DmaPusher::SkipImpossibleHeader(const CommandHeader& command_header) {
     if (reported.fetch_add(1) < 16) {
         LOG_WARNING(HW_GPU,
                     "Skipping impossible header {:#010x} (host method {:#x}, {} words) on ch {} "
-                    "in the entry at {:#x}",
+                    "in entry {} at {:#x} (submission {})",
                     command_header.argument, method, count, channel_state.bind_id,
-                    dma_state.dma_get);
+                    dma_pushbuffer_subindex, dma_state.dma_get,
+                    dma_pushbuffer.empty() ? u64{0} : dma_pushbuffer.front().submit_sequence);
     }
     return true;
 }

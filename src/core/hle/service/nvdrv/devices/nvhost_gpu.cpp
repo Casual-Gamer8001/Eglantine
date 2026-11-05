@@ -421,6 +421,9 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
 
     const auto bind_id = channel_state->bind_id;
 
+    static std::atomic<u64> submissions{};
+    entries.submit_sequence = submissions.fetch_add(1, std::memory_order_relaxed) + 1;
+
     if (g_nx2_driver) {
         for ([[maybe_unused]] const auto& entry : entries.command_lists) {
             LOG_TRACE(Service_NVDRV, "nx2 GPFIFO entry raw={:#018x} addr={:#x} size={:#x}", entry.raw,
@@ -532,9 +535,15 @@ NvResult nvhost_gpu::SubmitGPFIFOBase1(IoctlSubmitGpfifo& params,
     if (kickoff) {
         this->GetSessionMemory(fd).ReadBlock(params.address, entries.command_lists.data(),
                                              params.num_entries * sizeof(Tegra::CommandListHeader));
+        entries.submit_kind = 2;
+        entries.gpfifo_address = params.address;
+        if (const auto device = Nx2GpuMemoryRegistry::Get().DeviceAddressOf(params.address)) {
+            entries.gpfifo_device_address = *device;
+        }
     } else {
         std::memcpy(entries.command_lists.data(), commands.data(),
                     params.num_entries * sizeof(Tegra::CommandListHeader));
+        entries.submit_kind = 1;
     }
 
     return SubmitGPFIFOImpl(params, std::move(entries));
@@ -550,6 +559,7 @@ NvResult nvhost_gpu::SubmitGPFIFOBase2(IoctlSubmitGpfifo& params,
     Tegra::CommandList entries(params.num_entries);
     std::memcpy(entries.command_lists.data(), commands.data(),
                 params.num_entries * sizeof(Tegra::CommandListHeader));
+    entries.submit_kind = 3;
     return SubmitGPFIFOImpl(params, std::move(entries));
 }
 
