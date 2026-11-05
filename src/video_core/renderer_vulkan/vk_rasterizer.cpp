@@ -404,7 +404,9 @@ void DiagRecordDraw(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& 
             g_diag_draw.instances, static_cast<u32>(maxwell3d.draw_manager.draw_state.topology),
             regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height,
             static_cast<u32>(regs.rt[0].format), regs.zeta_enable, regs.blend.enable[0],
-            regs.color_mask[0].raw, mesh ? "mesh" : "", diag.ProgramKey(vs), diag.ProgramKey(ps)),
+            regs.color_mask[0].raw,
+            fmt::format("{}srgb={}", mesh ? "mesh " : "", regs.framebuffer_srgb),
+            diag.ProgramKey(vs), diag.ProgramKey(ps)),
             std::exchange(g_diag_query, -1), vs, ps);
     }
 }

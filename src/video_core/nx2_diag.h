@@ -41,7 +41,11 @@
 //                              bound at each draw are watched and the words that change from frame
 //                              to frame are reported in diag-state.json;
 //                            - draw-list: create it and the next frame's draws and dispatches are
-//                              written to draw-list-<n>.tsv (the file is removed).
+//                              written to draw-list-<n>.tsv (the file is removed); a draw's "extra"
+//                              column holds the framebuffer sRGB enable (srgb=0|1);
+//                            - upscale-decode / upscale-copy: while one exists, the copy that stands
+//                              in for a game upscaler that can't run decodes sRGB / copies plainly,
+//                              whatever the program's code suggests.
 //   EDEN_NX2_DIAG_SAMPLES=1  with a draw-list capture, count the samples each draw passes (an occlusion
 //                            query per draw, up to MaxProbeQueries) and add them to the draw list as
 //                            the "samples" column and to diag-state.json as "probe". A draw that

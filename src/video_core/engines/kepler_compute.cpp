@@ -1144,9 +1144,25 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: {}", program,
                  known->second ? "decodes sRGB like the program" : "plain copy");
     }
+    // <diag dir>/upscale-decode or upscale-copy picks the copy's mode while the game runs, to
+    // compare both on the same scene (checked every 30 upscales).
+    static int forced_decode = -1;
+    if (static u32 polls{}; !VideoCommon::Nx2Diag::DrawListDir().empty() && polls++ % 30 == 0) {
+        const auto& dir = VideoCommon::Nx2Diag::DrawListDir();
+        std::error_code ignored;
+        const int forced = std::filesystem::exists(dir / "upscale-decode", ignored) ? 1
+                           : std::filesystem::exists(dir / "upscale-copy", ignored)  ? 0
+                                                                                      : -1;
+        if (forced != forced_decode) {
+            forced_decode = forced;
+            LOG_INFO(HW_GPU, "Upscale fallback copy: {}",
+                     forced < 0 ? "as the program suggests" : forced ? "sRGB decode" : "plain copy");
+        }
+    }
+    const bool decode_srgb = forced_decode >= 0 ? forced_decode == 1 : known->second;
     const Fermi2D::Config config{
-        .operation = known->second ? Fermi2D::Operation::SrcCopySrgbToLinear
-                                   : Fermi2D::Operation::SrcCopy,
+        .operation = decode_srgb ? Fermi2D::Operation::SrcCopySrgbToLinear
+                                 : Fermi2D::Operation::SrcCopy,
         .filter = Fermi2D::Filter::Bilinear,
         .must_accelerate = true,
         .dst_x0 = 0,
