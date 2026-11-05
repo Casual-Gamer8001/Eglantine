@@ -272,8 +272,8 @@ void Report(const std::vector<Target>& targets, const std::vector<Sample>& sampl
     }
 }
 
-void Run(std::vector<std::string> patterns, double start, double seconds, std::string out) {
-    std::this_thread::sleep_for(std::chrono::duration<double>(start));
+void SampleThreads(const std::vector<std::string>& patterns, double seconds,
+                   const std::string& out) {
     const std::vector<Target> targets = FindThreads(patterns);
     std::fprintf(stderr, "nx2 sampler: %zu threads match, sampling %.0f s\n", targets.size(),
                  seconds);
@@ -308,15 +308,48 @@ void Run(std::vector<std::string> patterns, double start, double seconds, std::s
     }
 }
 
+void Run(std::vector<std::string> patterns, double start, double seconds, std::string out) {
+    std::this_thread::sleep_for(std::chrono::duration<double>(start));
+    SampleThreads(patterns, seconds, out);
+}
+
+// Waits for the trigger file; each time it appears, samples for the seconds it holds (default 20)
+// into <trigger>-<n>.txt (the .folded file is written last).
+void Watch(std::vector<std::string> patterns, std::string trigger) {
+    for (unsigned run = 1;; ++run) {
+        std::FILE* file = nullptr;
+        while ((file = std::fopen(trigger.c_str(), "rb")) == nullptr) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{500});
+        }
+        char text[256]{};
+        static_cast<void>(std::fread(text, 1, sizeof(text) - 1, file));
+        std::fclose(file);
+        std::remove(trigger.c_str());
+        double seconds = std::strtod(text, nullptr);
+        if (!(seconds > 0.0 && seconds <= 600.0)) {
+            seconds = 20.0;
+        }
+        SampleThreads(patterns, seconds, trigger + "-" + std::to_string(run) + ".txt");
+    }
+}
+
 } // Anonymous namespace
 
 void StartFromEnvironment() {
     const char* names = std::getenv("EDEN_NX2_SAMPLE");
-    if (names == nullptr || *names == '\0') {
+    const bool timed = names != nullptr && *names != '\0';
+    const std::vector<std::string> patterns = SplitNames(
+        timed ? names
+              : "CPUCore_*,GPU,GPUBack,HostTiming,VulkanWorker,VulkanPresent,GPUFencingThread");
+    if (const char* trigger = std::getenv("EDEN_NX2_SAMPLE_TRIGGER");
+        trigger != nullptr && *trigger != '\0') {
+        std::thread{Watch, patterns, std::string{trigger}}.detach();
+    }
+    if (!timed) {
         return;
     }
     const char* out = std::getenv("EDEN_NX2_SAMPLE_OUT");
-    std::thread{Run, SplitNames(names), EnvSeconds("EDEN_NX2_SAMPLE_START", 60.0),
+    std::thread{Run, patterns, EnvSeconds("EDEN_NX2_SAMPLE_START", 60.0),
                 EnvSeconds("EDEN_NX2_SAMPLE_SECONDS", 30.0),
                 std::string{out != nullptr ? out : "nx2_samples.txt"}}
         .detach();

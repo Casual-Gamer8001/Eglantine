@@ -11,6 +11,9 @@ namespace Nx2Sampler {
 // thread is paused about 1000 times a second and its call stack recorded; the counts per
 // function (where the thread is, and everything on its stack) go to EDEN_NX2_SAMPLE_OUT
 // (default nx2_samples.txt).
+// EDEN_NX2_SAMPLE_TRIGGER=<file>: sample on demand instead, whenever that file appears (it holds
+// the seconds, default 20); the report goes to <file>-<n>.txt. Without EDEN_NX2_SAMPLE, the
+// emulator's main threads are sampled.
 void StartFromEnvironment();
 
 } // namespace Nx2Sampler

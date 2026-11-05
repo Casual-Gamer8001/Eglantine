@@ -246,6 +246,12 @@ add_executable(yuzu
 
 set_target_properties(yuzu PROPERTIES OUTPUT_NAME "eglantine")
 
+# The NX2 sampling profiler (EDEN_NX2_SAMPLE*, nx2_sampler.h) lives with eden-cli; the GUI starts it
+# the same way.
+target_sources(yuzu PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/yuzu_cmd/nx2_sampler.cpp
+    ${PROJECT_SOURCE_DIR}/src/yuzu_cmd/nx2_sampler.h)
+
 # Shipped next to the executable: the NX2 switches a GUI launch cannot set another way. Read at
 # startup (LoadNx2Switches in main.cpp); a user copy in %APPDATA%\eden overrides it.
 add_custom_command(TARGET yuzu POST_BUILD
