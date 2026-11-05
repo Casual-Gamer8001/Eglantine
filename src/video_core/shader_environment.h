@@ -67,6 +67,9 @@ public:
 
     [[nodiscard]] bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
 
+    [[nodiscard]] bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset,
+                                                          u32 indirect) override;
+
     [[nodiscard]] std::optional<u64> Analyze();
 
     void SetCachedSize(size_t size_bytes);
@@ -108,6 +111,8 @@ protected:
     size_t native_source_size{};
     /// Lower matrix multiplies too (KeplerCompute::EmulatesNativeTensorPrograms).
     bool native_tensor{};
+    /// ... in the compact form (KeplerCompute::UsesCompactTensorPrograms).
+    bool native_compact_tensor{};
     std::shared_ptr<const LoweredNativeCode> lowered_native;
 
     Tegra::Texture::TICEntry ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
@@ -218,6 +223,9 @@ public:
     [[nodiscard]] bool IsNativeProgram() const override;
 
     [[nodiscard]] bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
+
+    [[nodiscard]] bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset,
+                                                          u32 indirect) override;
 
     [[nodiscard]] u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
 

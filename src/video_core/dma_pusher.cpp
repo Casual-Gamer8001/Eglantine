@@ -272,11 +272,14 @@ bool DmaPusher::Step() {
     }
 
     if (signal_sync) {
-        const VideoCommon::GpuSplit::BackHold hold{VideoCommon::GpuSplit::Get()};
-        rasterizer->SignalFence([this]() {
-            std::scoped_lock lk(sync_mutex);
-            synced = true;
-            sync_cv.notify_all();
+        // SignalFence invalidates the GPU caches, which can record copies into the scheduler: the
+        // back's state, which a drained back still submits from in its idle hook.
+        VideoCommon::GpuSplit::Get().Run([this] {
+            rasterizer->SignalFence([this]() {
+                std::scoped_lock lk(sync_mutex);
+                synced = true;
+                sync_cv.notify_all();
+            });
         });
     }
 
@@ -1111,15 +1114,19 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
         return;
     }
     // The caches belong to the split's back: it first runs what the front queued (the dispatch
-    // that writes these words among it) and is held while the front flushes them. The whole
-    // pages are flushed: their next lists read guest memory until GPU work writes them again.
-    const VideoCommon::GpuSplit::BackHold hold{VideoCommon::GpuSplit::Get()};
+    // that writes these words among it). The whole pages are flushed: their next lists read
+    // guest memory until GPU work writes them again.
+    VideoCommon::GpuSplit::Get().Drain();
     const GPUVAddr first_page = address & ~GPUVAddr{0xfff};
     const GPUVAddr end_page = (address + size + 0xfff) & ~GPUVAddr{0xfff};
     if (memory_manager.IsMemoryDirty(first_page, end_page - first_page,
                                      VideoCommon::CacheType::BufferCache)) {
-        memory_manager.FlushRegion(first_page, end_page - first_page,
-                                   VideoCommon::CacheType::BufferCache);
+        // The download records into the Vulkan scheduler, which the split's back owns: a drained
+        // back still submits from its idle hook, so the front must not flush these pages itself.
+        VideoCommon::GpuSplit::Get().Run(
+            [memory = &memory_manager, first_page, size = end_page - first_page] {
+                memory->FlushRegion(first_page, size, VideoCommon::CacheType::BufferCache);
+            });
     }
     if (rasterizer == nullptr) {
         return;
