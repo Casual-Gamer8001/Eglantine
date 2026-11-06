@@ -147,6 +147,7 @@ struct Symbolizer {
     using SymInitializeFn = BOOL(WINAPI*)(HANDLE, PCSTR, BOOL);
     using SymSetOptionsFn = DWORD(WINAPI*)(DWORD);
     using SymFromAddrFn = BOOL(WINAPI*)(HANDLE, DWORD64, PDWORD64, PSYMBOL_INFO);
+    using SymCleanupFn = BOOL(WINAPI*)(HANDLE);
 
     Symbolizer() {
         const HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
@@ -158,6 +159,7 @@ struct Symbolizer {
         const auto initialize =
             reinterpret_cast<SymInitializeFn>(GetProcAddress(dbghelp, "SymInitialize"));
         from_address = reinterpret_cast<SymFromAddrFn>(GetProcAddress(dbghelp, "SymFromAddr"));
+        cleanup = reinterpret_cast<SymCleanupFn>(GetProcAddress(dbghelp, "SymCleanup"));
         if (set_options == nullptr || initialize == nullptr || from_address == nullptr) {
             from_address = nullptr;
             return;
@@ -167,6 +169,16 @@ struct Symbolizer {
             from_address = nullptr;
         }
     }
+
+    // Each report initializes the symbol handler again. Without SymCleanup, every report after the
+    // first in a process failed to and named only the modules.
+    ~Symbolizer() {
+        if (from_address != nullptr && cleanup != nullptr) {
+            cleanup(GetCurrentProcess());
+        }
+    }
+    Symbolizer(const Symbolizer&) = delete;
+    Symbolizer& operator=(const Symbolizer&) = delete;
 
     const std::string& Name(DWORD64 address) {
         const auto [it, is_new] = cache.try_emplace(address);
@@ -199,6 +211,7 @@ struct Symbolizer {
     }
 
     SymFromAddrFn from_address{};
+    SymCleanupFn cleanup{};
     std::unordered_map<DWORD64, std::string> cache;
 };
 

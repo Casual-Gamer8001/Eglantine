@@ -6,6 +6,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdlib>
+#include <unordered_set>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -602,6 +605,59 @@ bool MemoryManager::IsMemoryDirty(GPUVAddr gpu_addr, size_t size,
     return result;
 }
 
+namespace {
+// EDEN_NX2_RANGE_STATS=1 (diagnostics): every 5 s, per thread, how MaxContinuousRange found its
+// answers and how often the page table changed meanwhile.
+enum class RangeLookup { Hit, Stale, Evicted };
+
+bool RangeStatsEnabled() {
+    static const bool enabled = std::getenv("EDEN_NX2_RANGE_STATS") != nullptr;
+    return enabled;
+}
+
+void NoteRangeLookup(RangeLookup lookup, GPUVAddr gpu_addr, size_t size, size_t result,
+                     u64 serial) {
+    struct Stats {
+        u64 calls{};
+        u64 hits{};
+        u64 stale{};
+        u64 evicted{};
+        u64 walked_bytes{};
+        u64 serial_start{};
+        std::chrono::steady_clock::time_point since{};
+        std::unordered_set<u64> ranges;
+    };
+    thread_local Stats stats;
+    const auto now = std::chrono::steady_clock::now();
+    if (stats.since == std::chrono::steady_clock::time_point{}) {
+        stats.since = now;
+        stats.serial_start = serial;
+    }
+    ++stats.calls;
+    if (lookup == RangeLookup::Hit) {
+        ++stats.hits;
+    } else {
+        ++(lookup == RangeLookup::Stale ? stats.stale : stats.evicted);
+        stats.walked_bytes += result;
+    }
+    stats.ranges.insert(gpu_addr ^ (u64{size} << 40));
+    const double seconds = std::chrono::duration<double>(now - stats.since).count();
+    if (seconds < 5.0) {
+        return;
+    }
+    LOG_INFO(HW_GPU,
+             "MaxContinuousRange per second: {:.0f} calls, {:.0f} hits, {:.0f} misses after a page "
+             "table change, {:.0f} misses to another range in the slot, {:.0f} KiB walked; {} "
+             "distinct ranges in {:.1f} s; the page table changed {:.1f} times a second",
+             stats.calls / seconds, stats.hits / seconds, stats.stale / seconds,
+             stats.evicted / seconds, stats.walked_bytes / 1024.0 / seconds, stats.ranges.size(),
+             seconds, (serial - stats.serial_start) / seconds);
+    stats = Stats{};
+    stats.since = now;
+    stats.serial_start = serial;
+}
+} // Anonymous namespace
+
 size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
     // Native storage buffers ask this for up to 8 MiB on each bind, ~70,000 times a second in
     // title 1's forest (17% of the GPU thread walking pages): keep answers per thread until the
@@ -616,12 +672,20 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
     thread_local std::array<Entry, 64> cache{};
     const u64 serial = map_serial.load(std::memory_order_acquire);
     Entry& entry = cache[((gpu_addr ^ size) * 0x9E3779B97F4A7C15ULL) >> 58];
-    if (entry.owner == unique_identifier + 1 && entry.gpu_addr == gpu_addr && entry.size == size &&
-        entry.serial == serial) {
+    const bool same_range =
+        entry.owner == unique_identifier + 1 && entry.gpu_addr == gpu_addr && entry.size == size;
+    if (same_range && entry.serial == serial) {
+        if (RangeStatsEnabled()) [[unlikely]] {
+            NoteRangeLookup(RangeLookup::Hit, gpu_addr, size, entry.result, serial);
+        }
         return entry.result;
     }
     const size_t result = MaxContinuousRangeUncached(gpu_addr, size);
     entry = {unique_identifier + 1, gpu_addr, size, serial, result};
+    if (RangeStatsEnabled()) [[unlikely]] {
+        NoteRangeLookup(same_range ? RangeLookup::Stale : RangeLookup::Evicted, gpu_addr, size,
+                        result, serial);
+    }
     return result;
 }
 
