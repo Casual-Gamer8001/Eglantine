@@ -1419,6 +1419,21 @@ std::span<u32> KeplerCompute::FrontMacroPositions(FrontState& fs) {
     return native_macro_positions;
 }
 
+void KeplerCompute::SwapMacroCall(MacroCall& call) {
+    const u32 method = native_executing_macro.value_or(0);
+    native_executing_macro = call.method != 0 ? std::optional<u32>{call.method} : std::nullopt;
+    call.method = method;
+    std::swap(native_parameters, call.parameters);
+}
+
+void KeplerCompute::FrontSwapMacroCall(VideoCommon::GpuSplit& split, MacroCall& call) {
+    auto& fs = Front(split);
+    const u32 method = fs.executing_macro.value_or(0);
+    fs.executing_macro = call.method != 0 ? std::optional<u32>{call.method} : std::nullopt;
+    call.method = method;
+    std::swap(fs.parameters, call.parameters);
+}
+
 void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split,
                                     u32 method, u32 argument, bool is_last_call,
                                     const GPUVAddr* segment) {

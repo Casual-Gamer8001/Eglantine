@@ -1155,6 +1155,20 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
 }
 
+void Maxwell3D::SwapMacroCall(MacroCall& call) {
+    std::swap(executing_macro, call.method);
+    std::swap(macro_params, call.parameters);
+    std::swap(macro_segments, call.segments);
+    std::swap(current_macro_dirty, call.dirty);
+}
+
+void Maxwell3D::FrontSwapMacroCall(Core::System& system, VideoCommon::GpuSplit& split,
+                                   MacroCall& call) {
+    auto& fs = Front(system, split);
+    std::swap(fs.executing_macro, call.method);
+    std::swap(fs.parameters, call.parameters);
+}
+
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
                               FrontState& fs) {
 #ifdef ARCHITECTURE_x86_64

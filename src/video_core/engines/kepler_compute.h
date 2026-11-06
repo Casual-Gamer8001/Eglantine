@@ -256,6 +256,9 @@ public:
     /// the front instead of CallMethod for native compute engines: runs their macros and macro
     /// uploads against a copy of the registers and sends the register writes to the back.
     bool FrontRunsMacros() const { return native_mode; }
+    void SwapMacroCall(MacroCall& call) override;
+    /// SwapMacroCall on the split's front, when it runs the macros (FrontCallMethod).
+    void FrontSwapMacroCall(VideoCommon::GpuSplit& split, MacroCall& call);
     void FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                          u32 argument, bool is_last_call, const GPUVAddr* segment);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,

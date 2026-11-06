@@ -11,6 +11,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -271,8 +272,16 @@ public:
         bool non_incrementing;
         bool increment_once;
         GPUVAddr resume_address; ///< Where the entry that continues the method starts
+        /// A macro method: the engine's unfinished call (the parameters so far), set aside with it.
+        std::shared_ptr<Engines::MacroCall> macro_call;
     };
-    void ResolveSplitMethod(GPUVAddr entry_address);
+    void ResolveSplitMethod(GPUVAddr entry_address, bool park_current);
+    /// Swaps the unfinished macro call of the engine on `subchannel` with `call` where that engine
+    /// collects macro parameters: the split's front, its back thread (in order), or the engine.
+    void SwapEngineMacroCall(u32 subchannel, const std::shared_ptr<Engines::MacroCall>& call);
+    /// The entry at index starts away from where the unfinished method's entry ended: whether it
+    /// is another command buffer called before the rest of the method's data.
+    [[nodiscard]] bool IsCallInsideMethod(const CommandList& list, size_t index) const;
     static constexpr size_t MaxParkedMethods = 16;
     /// An entry starts away from where an unfinished method's entry ended: log it and, with
     /// EDEN_NX2_SPLIT_DUMP, write the submission around it out.

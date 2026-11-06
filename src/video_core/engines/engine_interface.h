@@ -8,6 +8,7 @@
 
 #include <bitset>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include "common/common_types.h"
@@ -27,6 +28,15 @@ enum class EngineTypes : u32 {
     KeplerMemory,
 };
 
+/// A macro call whose parameters are still arriving: the macro method (0 when there is none) and
+/// the parameters sent so far (Maxwell3D also keeps where they came from).
+struct MacroCall {
+    u32 method{};
+    std::vector<u32> parameters;
+    std::vector<std::pair<GPUVAddr, size_t>> segments;
+    bool dirty{};
+};
+
 class EngineInterface {
 public:
     virtual ~EngineInterface() = default;
@@ -36,6 +46,11 @@ public:
 
     /// Write multiple values to the register identified by method.
     virtual void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) = 0;
+
+    /// Swaps the engine's unfinished macro call with `call`. Switch 2 command lists cut a macro's
+    /// parameters with another command buffer, which runs while the call is set aside
+    /// (DmaPusher::ResolveSplitMethod). Runs where the engine's methods run.
+    virtual void SwapMacroCall([[maybe_unused]] MacroCall& call) {}
 
     void ConsumeSink(Core::System& system) {
         if (!method_sink.empty()) {

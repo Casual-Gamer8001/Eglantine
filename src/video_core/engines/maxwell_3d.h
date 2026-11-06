@@ -3210,6 +3210,11 @@ public:
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
 
+    void SwapMacroCall(MacroCall& call) override;
+    /// SwapMacroCall on the split's front, when it runs the macros (FrontCallMethod).
+    void FrontSwapMacroCall(Core::System& system, VideoCommon::GpuSplit& split,
+                            MacroCall& call);
+
     bool ShouldExecute() const {
         return execute_on;
     }

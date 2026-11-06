@@ -129,6 +129,65 @@ bool DmaPusher::Step() {
     }
 
     if (header.size > 0) {
+        if (command_resume_offset == 0) {
+            // NVN cuts a method's data across GP entries in two ways:
+            // - the entry after the cut holds exactly the missing words (title 4: a macro's last
+            //   parameters in a 5-word subroutine entry; Ocarina of Time: macro parameters the GPU
+            //   writes) and the stream then goes on where the method's entry ended. The data
+            //   continues into that entry, as on the hardware.
+            // - the entry after the cut is another command buffer and a later entry starts where
+            //   the method's entry ended, with the rest of the data (Kokiri Forest: an 11-word
+            //   buffer runs between every 24-word piece of a list, cutting a viewport's depth range
+            //   or a macro's parameters). Continuing there feeds the call's commands to the method
+            //   and reads the rest of its data as commands, which ends in impossible headers and
+            //   garbage engine binds. The method waits for the entry that continues it instead
+            //   (ResolveSplitMethod) and the call starts clean.
+            // Cuts whose next entry starts elsewhere are counted and, with EDEN_NX2_SPLIT_DUMP,
+            // written out (DumpSplitAcrossEntries). EDEN_NX2_PARK_SPLIT_METHODS=0 always continues
+            // and =1 always waits, for comparison.
+            enum class SplitMode { Detect, Continue, Wait };
+            static const SplitMode split_mode = [] {
+                const char* value = std::getenv("EDEN_NX2_PARK_SPLIT_METHODS");
+                if (value == nullptr || value[0] == '\0') {
+                    return SplitMode::Detect;
+                }
+                return value[0] == '0' ? SplitMode::Continue : SplitMode::Wait;
+            }();
+            if (g_nx2_ampere) {
+                bool park = false;
+                if (dma_state.method_count != 0) {
+                    if (u64{header.addr} == split_method_end) {
+                        ++splits_continued;
+                    } else {
+                        ++splits_elsewhere;
+                        DumpSplitAcrossEntries(command_list, dma_pushbuffer_subindex);
+                        park = split_mode == SplitMode::Wait ||
+                               (split_mode == SplitMode::Detect &&
+                                IsCallInsideMethod(command_list, dma_pushbuffer_subindex));
+                        if (park && split_mode == SplitMode::Detect) {
+                            static std::atomic<u32> logged{};
+                            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                                LOG_INFO(HW_GPU,
+                                         "Method {:#x} (sub {}, {} words left) waits for the entry "
+                                         "at {:#x}: entry {} at {:#x} ({} words) is a call",
+                                         dma_state.method, dma_state.subchannel,
+                                         dma_state.method_count, split_method_end,
+                                         dma_pushbuffer_subindex, u64{header.addr},
+                                         u64{header.size});
+                            }
+                        }
+                    }
+                }
+                if (split_mode != SplitMode::Continue) {
+                    ResolveSplitMethod(header.addr, park);
+                }
+            }
+            if (dma_pushbuffer_subindex < command_list.submit_hashes.size()) {
+                CheckSubmitHash(header, command_list.submit_hashes[dma_pushbuffer_subindex]);
+            }
+        }
+        // After ResolveSplitMethod: a method set aside has no payload in this entry, and a resumed
+        // one has (its macro parameters may be words the GPU wrote).
         if (subchannels[dma_state.subchannel] && dma_state.method_count) {
             const auto engine = subchannel_type[dma_state.subchannel];
             const bool kepler_payload = engine == Engines::EngineTypes::KeplerCompute && dma_state.method == ComputeInline && dma_state.non_incrementing;
@@ -145,36 +204,6 @@ bool DmaPusher::Step() {
                 } else {
                     engine_state->current_dirty = memory_manager.IsMemoryDirty(dma_state.dma_get, words * sizeof(u32));
                 }
-            }
-        }
-        if (command_resume_offset == 0) {
-            // A method's data continues across GP entries, whatever their level, as on the
-            // hardware: title 4 ends a main entry after a macro's first word and supplies the
-            // remaining parameters in a 5-word subroutine entry. Ocarina of Time also has entries
-            // that start elsewhere between a method's first words and the rest (Kokiri Forest:
-            // a viewport's depth range), which the hardware could not run either; those are
-            // counted and, with EDEN_NX2_SPLIT_DUMP, written out (DumpSplitAcrossEntries).
-            // EDEN_NX2_PARK_SPLIT_METHODS=1 restores the old guess (an entry elsewhere is a call
-            // that starts clean; the method resumes where its entry ended).
-            static const bool park_split_methods = [] {
-                const char* value = std::getenv("EDEN_NX2_PARK_SPLIT_METHODS");
-                return value != nullptr && value[0] != '\0' && value[0] != '0';
-            }();
-            if (g_nx2_ampere) {
-                if (dma_state.method_count != 0) {
-                    if (u64{header.addr} == split_method_end) {
-                        ++splits_continued;
-                    } else {
-                        ++splits_elsewhere;
-                        DumpSplitAcrossEntries(command_list, dma_pushbuffer_subindex);
-                    }
-                }
-                if (park_split_methods) {
-                    ResolveSplitMethod(header.addr);
-                }
-            }
-            if (dma_pushbuffer_subindex < command_list.submit_hashes.size()) {
-                CheckSubmitHash(header, command_list.submit_hashes[dma_pushbuffer_subindex]);
             }
         }
         // A resumed entry is read again: the words after the acquire may be new by now.
@@ -405,10 +434,11 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
 }
 
 // NVN on Switch 2 ends GPFIFO entries in the middle of a method's data and calls another command
-// buffer (e.g. a compute dispatch) before the entry that carries the rest, which starts right
-// where the first one ended. An entry starting anywhere else is such a call: run it with a clean
-// method state and resume the unfinished method when the stream continues at that address.
-void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
+// buffer before the entry that carries the rest, which starts right where the first one ended.
+// With park_current the entry at entry_address is such a call: the unfinished method, with a
+// macro's parameters so far, is set aside so the call runs with a clean method state, and resumes
+// when the stream continues where the method's entry ended.
+void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address, bool park_current) {
     const auto continued = std::ranges::find(parked_methods, entry_address,
                                              &ParkedMethod::resume_address);
     std::optional<ParkedMethod> resume;
@@ -416,7 +446,7 @@ void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
         resume = *continued;
         parked_methods.erase(continued);
     }
-    if (dma_state.method_count != 0 && entry_address != split_method_end) {
+    if (park_current) {
         if (parked_methods.size() == MaxParkedMethods) {
             static std::atomic<u32> reported{};
             if (reported.fetch_add(1) < 8) {
@@ -428,14 +458,22 @@ void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
             }
             parked_methods.erase(parked_methods.begin());
         }
-        parked_methods.push_back(ParkedMethod{
+        ParkedMethod parked{
             .method = dma_state.method,
             .subchannel = dma_state.subchannel,
             .method_count = dma_state.method_count,
             .non_incrementing = dma_state.non_incrementing,
             .increment_once = dma_increment_once,
             .resume_address = split_method_end,
-        });
+        };
+        // A macro's parameters so far wait with it, so the call's macros start clean. Left in
+        // the engine, the call's 6-parameter macro ran the cut macro with both calls' parameters
+        // and the rest started another call (Kokiri Forest: parameter FIFO underflows, a crash).
+        if (dma_state.method >= MacroRegistersStart) {
+            parked.macro_call = std::make_shared<Engines::MacroCall>();
+            SwapEngineMacroCall(dma_state.subchannel, parked.macro_call);
+        }
+        parked_methods.push_back(std::move(parked));
         dma_state.method_count = 0;
         dma_increment_once = false;
     }
@@ -445,17 +483,65 @@ void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
         dma_state.method_count = resume->method_count;
         dma_state.non_incrementing = resume->non_incrementing;
         dma_increment_once = resume->increment_once;
+        if (resume->macro_call) {
+            SwapEngineMacroCall(resume->subchannel, resume->macro_call);
+        }
     }
 }
 
-// An entry starts away from where the unfinished method's entry ended. The hardware continues the
-// method's data into it all the same, so a driver never submits that unless the entry holds the
-// data (title 4's macro parameters). The first ones are logged; EDEN_NX2_SPLIT_DUMP=<dir> also
-// writes the submission around each of the first 16 as <dir>/nx2_split-NN.txt: every GP entry
-// (raw, level, privilege and sync bits, whether the GPU writes its pages, whether its words
-// changed since they were submitted), the words of the entries around the split as submitted and
-// as in memory now, and for kicked-off submissions whether the GPFIFO entries in guest memory
-// still match the ones submitted.
+void DmaPusher::SwapEngineMacroCall(u32 subchannel,
+                                    const std::shared_ptr<Engines::MacroCall>& call) {
+    auto* const engine = subchannels[subchannel];
+    const auto type = subchannel_type[subchannel];
+    if (engine == nullptr || (type != Engines::EngineTypes::Maxwell3D &&
+                              type != Engines::EngineTypes::KeplerCompute)) {
+        return;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.Active()) {
+        engine->SwapMacroCall(*call);
+        return;
+    }
+    // Where CallMethod sends the parameters: the front's macros, else the back thread.
+    if (split.FrontMacros()) {
+        if (type == Engines::EngineTypes::Maxwell3D) {
+            auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(engine);
+            if (maxwell3d->GetNativeMacroEngine().native_turing) {
+                maxwell3d->FrontSwapMacroCall(system, split, *call);
+                return;
+            }
+        } else {
+            auto* const compute = static_cast<Engines::KeplerCompute*>(engine);
+            if (compute->FrontRunsMacros()) {
+                compute->FrontSwapMacroCall(split, *call);
+                return;
+            }
+        }
+    }
+    split.DeferFunction([engine, call] { engine->SwapMacroCall(*call); });
+}
+
+// The entry at index starts away from where the unfinished method's entry ended. Unless it holds
+// exactly the missing words, it is a call when a later entry of the submission starts where the
+// method's entry ended: that one carries the rest of the data.
+bool DmaPusher::IsCallInsideMethod(const CommandList& list, size_t index) const {
+    const auto& entries = list.command_lists;
+    if (u64{entries[index].size} == dma_state.method_count) {
+        return false;
+    }
+    return std::any_of(entries.begin() + index + 1, entries.end(),
+                       [this](const CommandListHeader& entry) {
+                           return u64{entry.addr} == split_method_end;
+                       });
+}
+
+// An entry starts away from where the unfinished method's entry ended: it holds the missing words
+// or is a call before them (IsCallInsideMethod). The first ones are logged;
+// EDEN_NX2_SPLIT_DUMP=<dir> also writes the submission around each of the first 16 as
+// <dir>/nx2_split-NN.txt: every GP entry (raw, level, privilege and sync bits, whether the GPU
+// writes its pages, whether its words changed since they were submitted), the words of the
+// entries around the split as submitted and as in memory now, and for kicked-off submissions
+// whether the GPFIFO entries in guest memory still match the ones submitted.
 void DmaPusher::DumpSplitAcrossEntries(const CommandList& list, size_t index) {
     const auto& entries = list.command_lists;
     const CommandListHeader& current = entries[index];
