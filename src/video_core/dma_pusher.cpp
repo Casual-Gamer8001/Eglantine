@@ -522,17 +522,14 @@ void DmaPusher::SwapEngineMacroCall(u32 subchannel,
 }
 
 // The entry at index starts away from where the unfinished method's entry ended. Unless it holds
-// exactly the missing words, it is a call when a later entry of the submission starts where the
-// method's entry ended: that one carries the rest of the data.
+// exactly the missing words, it is a call, whether or not a later entry of the submission starts
+// where the method's entry ended. At the start of gameplay Ocarina of Time also cuts methods that
+// no later entry continues, and the entry after one starts with commands of its own. Continued
+// into it, a cut macro took the header and first parameter of the entry's first macro call as
+// its last parameters, and that call was lost. Set aside, the cut method is dropped when the
+// submission ends.
 bool DmaPusher::IsCallInsideMethod(const CommandList& list, size_t index) const {
-    const auto& entries = list.command_lists;
-    if (u64{entries[index].size} == dma_state.method_count) {
-        return false;
-    }
-    return std::any_of(entries.begin() + index + 1, entries.end(),
-                       [this](const CommandListHeader& entry) {
-                           return u64{entry.addr} == split_method_end;
-                       });
+    return u64{list.command_lists[index].size} != dma_state.method_count;
 }
 
 // An entry starts away from where the unfinished method's entry ended: it holds the missing words
