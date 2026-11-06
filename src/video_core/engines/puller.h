@@ -92,6 +92,11 @@ public:
     [[nodiscard]] bool CanResumeAcquire(DmaPusher& dma_pusher);
     /// Clears the pending acquire once it is met; false while the channel has to keep waiting.
     bool ResumeAcquire(DmaPusher& dma_pusher);
+    /// Whether the last resume was on a release the emulated GPU wrote (Nx2SemaphoreWaiters
+    /// latched it), not one the game wrote.
+    [[nodiscard]] bool LastResumeByGpu() const {
+        return last_resume_by_gpu;
+    }
 
     void CallMethod(DmaPusher& dma_pusher, const MethodCall& method_call);
     void CallMultiMethod(DmaPusher& dma_pusher, u32 method, u32 subchannel, const u32* base_start, u32 amount, u32 methods_pending);
@@ -152,6 +157,7 @@ private:
     [[nodiscard]] bool ExecuteMethodOnEngine(DmaPusher& dma_pusher, u32 method);
 
     std::optional<PendingAcquire> pending_acquire;
+    bool last_resume_by_gpu = false;
 
     /// Mapping of command subchannels to their bound engine ids
     std::array<EngineID, 8> bound_engines{};

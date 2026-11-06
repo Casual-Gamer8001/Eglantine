@@ -4,8 +4,11 @@
 // SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
 #include <atomic>
 #include <cstdlib>
+#include <mutex>
+#include <string>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -150,6 +153,7 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     // counting those made the count odd ("suspended") at random, so submit-time snapshots were
     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
     if (pending_acquire) {
+        last_resume_by_gpu = Nx2SemaphoreWaiters::Get().Latched(this);
         if (DmaPusher::SnapshotTraceEnabled()) {
             const auto now = std::chrono::steady_clock::now();
             using Ms = std::chrono::duration<float, std::milli>;
@@ -160,9 +164,28 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
             if (static std::atomic<u32> logged{};
                 (late >= 2.0f || waited >= 50.0f) && logged.fetch_add(1) < 300) {
                 LOG_INFO(HW_GPU,
-                         "Channel {} resumed after waiting {:.1f} ms on semaphore {:#x}; the value "
-                         "was in guest memory {:.1f} ms before",
-                         dma_pusher.channel_state.bind_id, waited, pending_acquire->address, late);
+                         "Channel {} resumed after waiting {:.1f} ms on semaphore {:#x} ({}); "
+                         "the value was in guest memory {:.1f} ms before",
+                         dma_pusher.channel_state.bind_id, waited, pending_acquire->address,
+                         last_resume_by_gpu ? "GPU release" : "CPU release", late);
+            }
+            // Every 10 s: resumes on GPU and on CPU releases, per channel.
+            static std::mutex stats_mutex;
+            static std::array<std::array<u32, 2>, 16> resumes{};
+            static auto since = now;
+            const std::scoped_lock stats_lock{stats_mutex};
+            ++resumes[dma_pusher.channel_state.bind_id & 15][last_resume_by_gpu ? 1 : 0];
+            if (now - since >= std::chrono::seconds{10}) {
+                std::string text;
+                for (size_t channel = 0; channel < resumes.size(); ++channel) {
+                    if (resumes[channel][0] + resumes[channel][1] != 0) {
+                        text += fmt::format(" ch{} {} GPU/{} CPU;", channel, resumes[channel][1],
+                                            resumes[channel][0]);
+                    }
+                }
+                LOG_INFO(HW_GPU, "Resumes in the last 10 s:{}", text);
+                resumes = {};
+                since = now;
             }
         }
         pending_acquire.reset();

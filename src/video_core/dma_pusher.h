@@ -246,8 +246,9 @@ public:
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
     /// Copies the list's words from memory again, as of suspension count `now`.
     void RefreshSnapshot(CommandList& list, u64 now, const char* reason);
-    /// At a resume: copies the lists in in_transit again, as of suspension count `now`.
-    void CopyInTransitAgain(u64 now);
+    /// At a resume: copies the lists in in_transit again, as of suspension count `now` (reread
+    /// false: their copies stand as of `now`).
+    void CopyInTransitAgain(u64 now, bool reread);
     /// Push: takes the copy a resume took of the list on its way, if one did.
     void TakeInTransitCopy(CommandList& list);
     /// EDEN_NX2_SNAPSHOT_TRACE: records and logs a copy taken after submit (RefreshSnapshot,
@@ -264,6 +265,15 @@ public:
             return value == nullptr || (value[0] != '0' && !KeepSubmitCopies());
         }();
         return enabled;
+    }
+    /// Copy again only after a release the game wrote, not one the emulated GPU wrote
+    /// (Puller::LastResumeByGpu). EDEN_NX2_RESNAPSHOT=all: after every release.
+    static bool OnlyAfterCpuReleases() {
+        static const bool only = [] {
+            const char* value = std::getenv("EDEN_NX2_RESNAPSHOT");
+            return value == nullptr || std::string{value} != "all";
+        }();
+        return only;
     }
     /// EDEN_NX2_RESNAPSHOT=submit (diagnostics): every list runs as copied at submit, also after
     /// a semaphore wait.
@@ -297,9 +307,10 @@ public:
         std::vector<CommandListHeader> entries;
         std::vector<u32> offsets;
         size_t words = 0;
-        bool copied = false;
+        bool copied = false;  ///< newer holds a copy a resume took
+        bool current = false; ///< Its copy (newer, else the one at submit) stands as of suspensions
         std::vector<CommandHeader> newer;
-        u64 suspensions = 0; ///< DmaPusher::suspensions when copied
+        u64 suspensions = 0; ///< DmaPusher::suspensions its copy stands as of
         std::chrono::steady_clock::time_point copied_at{};
     };
     std::mutex in_transit_mutex;

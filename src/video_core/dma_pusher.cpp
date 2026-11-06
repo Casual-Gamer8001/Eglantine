@@ -88,16 +88,26 @@ bool DmaPusher::Step() {
     // are written and the memory not yet reused: copy them here. EDEN_NX2_RESNAPSHOT=0: off.
     if (ResnapshotEnabled() && suspensions.load(std::memory_order_relaxed) != suspensions_before) {
         const u64 now = suspensions.load(std::memory_order_acquire);
+        // Only after a release the game wrote. One the emulated GPU wrote comes when the GPU
+        // thread gets to it, maybe long after the game wrote these commands, and the game may
+        // have reused the memory since (Ocarina of Time: channel 2's semaphore values a frame
+        // ahead, other commands in place of channel 1's).
+        const bool reread = !(OnlyAfterCpuReleases() && puller.LastResumeByGpu());
         for (CommandList& list : dma_pushbuffer) {
-            if (!list.submitted_offsets.empty()) {
+            if (list.submitted_offsets.empty()) {
+                continue;
+            }
+            if (reread) {
                 RefreshSnapshot(list, now, "after a semaphore wait");
+            } else {
+                list.snapshot_suspensions = now;
             }
         }
         // And the lists submitted but not queued here yet. Copied when queued instead, they were
         // copied up to half a second after the submit at the start of Ocarina of Time gameplay
         // (the GPU thread building pipelines), when the game had refilled the memory for a later
         // frame: misread headers, entries waiting for words that never came, then a freeze.
-        CopyInTransitAgain(now);
+        CopyInTransitAgain(now, reread);
     }
 
     CommandList& command_list = dma_pushbuffer.front();
@@ -1190,10 +1200,15 @@ void DmaPusher::CopySubmittedWords(CommandList& entries) {
     }
 }
 
-void DmaPusher::CopyInTransitAgain(u64 now) {
+void DmaPusher::CopyInTransitAgain(u64 now, bool reread) {
     const std::scoped_lock lock{in_transit_mutex};
     const auto time = std::chrono::steady_clock::now();
     for (InTransitList& list : in_transit) {
+        list.current = true;
+        if (!reread) {
+            list.suspensions = now;
+            continue;
+        }
         list.newer.resize(list.words);
         for (size_t i = 0; i < list.entries.size(); ++i) {
             memory_manager.ReadBlockUnsafe(list.entries[i].addr, list.newer.data() + list.offsets[i],
@@ -1219,7 +1234,11 @@ void DmaPusher::TakeInTransitCopy(CommandList& list) {
         taken = std::move(in_transit.front());
         in_transit.pop_front();
     }
+    if (!taken.current) {
+        return;
+    }
     if (!taken.copied || taken.newer.size() != list.submitted_words.size()) {
+        list.snapshot_suspensions = taken.suspensions;
         return;
     }
     const u64 old_count = list.snapshot_suspensions;
