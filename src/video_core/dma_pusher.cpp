@@ -93,6 +93,11 @@ bool DmaPusher::Step() {
                 RefreshSnapshot(list, now, "after a semaphore wait");
             }
         }
+        // And the lists submitted but not queued here yet. Copied when queued instead, they were
+        // copied up to half a second after the submit at the start of Ocarina of Time gameplay
+        // (the GPU thread building pipelines), when the game had refilled the memory for a later
+        // frame: misread headers, entries waiting for words that never came, then a freeze.
+        CopyInTransitAgain(now);
     }
 
     CommandList& command_list = dma_pushbuffer.front();
@@ -1151,6 +1156,105 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
     }
 }
 
+void DmaPusher::CopySubmittedWords(CommandList& entries) {
+    size_t words = 0;
+    for (const auto& entry : entries.command_lists) {
+        words += entry.size;
+    }
+    // Under the lock a resume copies the lists in transit again with: this copy is either after
+    // the resume or in in_transit for it.
+    const std::scoped_lock lock{in_transit_mutex};
+    // Before the copy: a suspension during it must count as one after it.
+    entries.snapshot_suspensions = suspensions.load(std::memory_order_acquire);
+    entries.submitted_words.resize(words);
+    entries.submitted_offsets.reserve(entries.command_lists.size());
+    size_t offset = 0;
+    for (const auto& entry : entries.command_lists) {
+        entries.submitted_offsets.push_back(static_cast<u32>(offset));
+        memory_manager.ReadBlockUnsafe(entry.addr, entries.submitted_words.data() + offset,
+                                       entry.size * sizeof(u32));
+        offset += entry.size;
+    }
+    entries.submitted_at = std::chrono::steady_clock::now();
+    if (SnapshotTraceEnabled()) {
+        entries.submit_copy = entries.submitted_words;
+    }
+    if (ResnapshotEnabled()) {
+        in_transit.push_back(InTransitList{
+            .submit_sequence = entries.submit_sequence,
+            .entries = std::vector<CommandListHeader>(entries.command_lists.begin(),
+                                                      entries.command_lists.end()),
+            .offsets = entries.submitted_offsets,
+            .words = words,
+        });
+    }
+}
+
+void DmaPusher::CopyInTransitAgain(u64 now) {
+    const std::scoped_lock lock{in_transit_mutex};
+    const auto time = std::chrono::steady_clock::now();
+    for (InTransitList& list : in_transit) {
+        list.newer.resize(list.words);
+        for (size_t i = 0; i < list.entries.size(); ++i) {
+            memory_manager.ReadBlockUnsafe(list.entries[i].addr, list.newer.data() + list.offsets[i],
+                                           list.entries[i].size * sizeof(u32));
+        }
+        list.copied = true;
+        list.suspensions = now;
+        list.copied_at = time;
+    }
+}
+
+void DmaPusher::TakeInTransitCopy(CommandList& list) {
+    InTransitList taken;
+    {
+        const std::scoped_lock lock{in_transit_mutex};
+        // Older lists never come (nvhost-gpu failed the submit after the copy).
+        while (!in_transit.empty() && in_transit.front().submit_sequence < list.submit_sequence) {
+            in_transit.pop_front();
+        }
+        if (in_transit.empty() || in_transit.front().submit_sequence != list.submit_sequence) {
+            return;
+        }
+        taken = std::move(in_transit.front());
+        in_transit.pop_front();
+    }
+    if (!taken.copied || taken.newer.size() != list.submitted_words.size()) {
+        return;
+    }
+    const u64 old_count = list.snapshot_suspensions;
+    u32 changed_entries = 0;
+    u64 changed_words = 0;
+    size_t first_changed = list.command_lists.size();
+    const bool trace = SnapshotTraceEnabled();
+    if (trace) {
+        for (size_t i = 0; i < list.command_lists.size() && i < list.submitted_offsets.size(); ++i) {
+            const u32 offset = list.submitted_offsets[i];
+            const u32 size = static_cast<u32>(list.command_lists[i].size);
+            if (offset + size > taken.newer.size()) {
+                continue;
+            }
+            const CommandHeader* const before = list.submitted_words.data() + offset;
+            const CommandHeader* const after = taken.newer.data() + offset;
+            u32 differ = 0;
+            for (u32 j = 0; j < size; ++j) {
+                differ += before[j].argument != after[j].argument ? 1 : 0;
+            }
+            if (differ != 0) {
+                ++changed_entries;
+                changed_words += differ;
+                first_changed = (std::min)(first_changed, i);
+            }
+        }
+    }
+    list.submitted_words.swap(taken.newer);
+    list.snapshot_suspensions = taken.suspensions;
+    if (trace) {
+        NoteRecopy(list, "on its way, after a semaphore wait", old_count, taken.suspensions,
+                   changed_entries, changed_words, first_changed, taken.copied_at);
+    }
+}
+
 void DmaPusher::RefreshSnapshot(CommandList& list, u64 now, const char* reason) {
     const u64 old_count = list.snapshot_suspensions;
     list.snapshot_suspensions = now;
@@ -1188,8 +1292,11 @@ void DmaPusher::RefreshSnapshot(CommandList& list, u64 now, const char* reason) 
 }
 
 void DmaPusher::NoteRecopy(CommandList& list, const char* reason, u64 old_count, u64 now,
-                           u32 changed_entries, u64 changed_words, size_t first_changed) {
-    const auto time = std::chrono::steady_clock::now();
+                           u32 changed_entries, u64 changed_words, size_t first_changed,
+                           std::chrono::steady_clock::time_point copied_at) {
+    const auto time = copied_at == std::chrono::steady_clock::time_point{}
+                          ? std::chrono::steady_clock::now()
+                          : copied_at;
     const float age_ms =
         list.submitted_at == std::chrono::steady_clock::time_point{}
             ? -1.0f

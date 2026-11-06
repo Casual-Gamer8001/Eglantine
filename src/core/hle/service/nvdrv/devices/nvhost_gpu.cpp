@@ -449,26 +449,7 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
             return value == nullptr || value[0] != '0';
         }();
         if (snapshot && channel_state->memory_manager && channel_state->payload) {
-            // Before the copy: a suspension during it must count as one after it.
-            entries.snapshot_suspensions =
-                channel_state->payload->dma_pusher.suspensions.load(std::memory_order_acquire);
-            size_t words = 0;
-            for (const auto& entry : entries.command_lists) {
-                words += entry.size;
-            }
-            entries.submitted_words.resize(words);
-            entries.submitted_offsets.reserve(entries.command_lists.size());
-            size_t offset = 0;
-            for (const auto& entry : entries.command_lists) {
-                entries.submitted_offsets.push_back(static_cast<u32>(offset));
-                channel_state->memory_manager->ReadBlockUnsafe(
-                    entry.addr, entries.submitted_words.data() + offset, entry.size * sizeof(u32));
-                offset += entry.size;
-            }
-            entries.submitted_at = std::chrono::steady_clock::now();
-            if (Tegra::DmaPusher::SnapshotTraceEnabled()) {
-                entries.submit_copy = entries.submitted_words;
-            }
+            channel_state->payload->dma_pusher.CopySubmittedWords(entries);
         }
     }
 
