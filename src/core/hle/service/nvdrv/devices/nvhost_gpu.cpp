@@ -465,6 +465,10 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
                     entry.addr, entries.submitted_words.data() + offset, entry.size * sizeof(u32));
                 offset += entry.size;
             }
+            entries.submitted_at = std::chrono::steady_clock::now();
+            if (Tegra::DmaPusher::SnapshotTraceEnabled()) {
+                entries.submit_copy = entries.submitted_words;
+            }
         }
     }
 

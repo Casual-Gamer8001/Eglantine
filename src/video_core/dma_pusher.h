@@ -133,6 +133,14 @@ struct CommandList final {
     /// that waited behind one, reads memory instead: games write the commands it runs before they
     /// release the acquire.
     u64 snapshot_suspensions = 0;
+    /// When nvhost-gpu copied the words. EDEN_NX2_SNAPSHOT_TRACE (diagnostics): the words as copied
+    /// then (submitted_words may be copied again since) and how the last copy since went.
+    std::chrono::steady_clock::time_point submitted_at{};
+    std::vector<CommandHeader> submit_copy;
+    u32 recopies = 0;
+    u32 recopy_changed_entries = 0;
+    float recopy_age_ms = 0.0f;
+    const char* recopy_reason = "";
     /// Where nvhost-gpu got the entries (diagnostics, DmaPusher::DumpSplitAcrossEntries).
     u64 submit_sequence = 0;       ///< Counts guest GPFIFO submissions, all channels
     u32 submit_kind = 0;           ///< 0 emulator-built, 1 SubmitGpfifo, 2 KickoffPb, 3 inline
@@ -160,6 +168,14 @@ public:
     /// the channel is suspended (see CommandList::snapshot_suspensions).
     std::atomic<u64> suspensions{0};
 
+    /// EDEN_NX2_SNAPSHOT_TRACE=1 (diagnostics): logs the command list copies taken after submit
+    /// and how long channels waited on semaphores, and keeps each list's words as submitted for
+    /// the EDEN_NX2_SPLIT_DUMP dumps.
+    [[nodiscard]] static bool SnapshotTraceEnabled() {
+        static const bool enabled = std::getenv("EDEN_NX2_SNAPSHOT_TRACE") != nullptr;
+        return enabled;
+    }
+
     explicit DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_);
     ~DmaPusher();
 
@@ -168,7 +184,7 @@ public:
         const u64 now = suspensions.load(std::memory_order_acquire);
         if (ResnapshotEnabled() && !entries.submitted_offsets.empty() && (now & 1) == 0 &&
             entries.snapshot_suspensions != now) {
-            RefreshSnapshot(entries, now);
+            RefreshSnapshot(entries, now, "when queued");
         }
         dma_pushbuffer.push_back(std::move(entries));
     }
@@ -220,15 +236,28 @@ public:
     /// Whether the entry lies on device pages the GPU has written (NX2).
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
     /// Copies the list's words from memory again, as of suspension count `now`.
-    void RefreshSnapshot(CommandList& list, u64 now);
+    void RefreshSnapshot(CommandList& list, u64 now, const char* reason);
+    /// EDEN_NX2_SNAPSHOT_TRACE: records and logs a copy RefreshSnapshot took.
+    void NoteRecopy(CommandList& list, const char* reason, u64 old_count, u64 now,
+                    u32 changed_entries, u64 changed_words, size_t first_changed);
+    std::vector<u32> recopy_scratch;
 
-    /// EDEN_NX2_RESNAPSHOT=0 turns snapshot refreshes off.
+    /// EDEN_NX2_RESNAPSHOT=0 turns snapshot refreshes off: lists that waited read memory.
     static bool ResnapshotEnabled() {
         static const bool enabled = [] {
             const char* value = std::getenv("EDEN_NX2_RESNAPSHOT");
-            return value == nullptr || value[0] != '0';
+            return value == nullptr || (value[0] != '0' && !KeepSubmitCopies());
         }();
         return enabled;
+    }
+    /// EDEN_NX2_RESNAPSHOT=submit (diagnostics): every list runs as copied at submit, also after
+    /// a semaphore wait.
+    static bool KeepSubmitCopies() {
+        static const bool keep = [] {
+            const char* value = std::getenv("EDEN_NX2_RESNAPSHOT");
+            return value != nullptr && std::string{value} == "submit";
+        }();
+        return keep;
     }
     /// Reads a command list on pages the GPU wrote into command_headers, from the copies the
     /// buffer cache made after the work that wrote them or from guest memory for pages flushed

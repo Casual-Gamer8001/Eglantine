@@ -80,6 +80,8 @@ public:
         std::chrono::steady_clock::time_point since;
         std::chrono::steady_clock::time_point last_fences; ///< When it last released fences
         bool reported;
+        /// EDEN_NX2_SNAPSHOT_TRACE: the first poll that found the value in guest memory.
+        std::chrono::steady_clock::time_point seen_in_memory{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };

@@ -87,6 +87,12 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
         return true;
     }
+    // EDEN_NX2_SNAPSHOT_TRACE: when the release first shows in guest memory, before the drain.
+    if (DmaPusher::SnapshotTraceEnabled() &&
+        pending_acquire->seen_in_memory == std::chrono::steady_clock::time_point{} &&
+        pending_acquire->Matches(dma_pusher.memory_manager.Read<u32>(pending_acquire->address))) {
+        pending_acquire->seen_in_memory = std::chrono::steady_clock::now();
+    }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
     DrainBack();
@@ -144,6 +150,21 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     // counting those made the count odd ("suspended") at random, so submit-time snapshots were
     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
     if (pending_acquire) {
+        if (DmaPusher::SnapshotTraceEnabled()) {
+            const auto now = std::chrono::steady_clock::now();
+            using Ms = std::chrono::duration<float, std::milli>;
+            const auto seen = pending_acquire->seen_in_memory;
+            const float waited = Ms(now - pending_acquire->since).count();
+            const float late =
+                seen == std::chrono::steady_clock::time_point{} ? 0.0f : Ms(now - seen).count();
+            if (static std::atomic<u32> logged{};
+                (late >= 2.0f || waited >= 50.0f) && logged.fetch_add(1) < 300) {
+                LOG_INFO(HW_GPU,
+                         "Channel {} resumed after waiting {:.1f} ms on semaphore {:#x}; the value "
+                         "was in guest memory {:.1f} ms before",
+                         dma_pusher.channel_state.bind_id, waited, pending_acquire->address, late);
+            }
+        }
         pending_acquire.reset();
         dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
         Nx2SemaphoreWaiters::Get().Remove(this);
