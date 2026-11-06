@@ -14,7 +14,8 @@
 #include "common/cpu_features.h"
 
 // EDEN_NX2_GPU_PROFILE: time where the GPU thread spends its time. Each zone counts its own
-// (exclusive) time, nested zones excluded; every 10 s the thread logs each zone's share.
+// (exclusive) time, nested zones excluded; every 10 s (EDEN_NX2_REPORT_SECONDS) the thread logs
+// each zone's share.
 namespace VideoCommon::Nx2Profile {
 
 enum class Zone : u32 {
@@ -69,6 +70,18 @@ inline const bool g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
 
 inline bool Enabled() {
     return g_enabled;
+}
+
+// EDEN_NX2_REPORT_SECONDS=<s>: the report window of the GPU profile and of the GPU timestamps
+// (EDEN_NX2_GPU_TIMESTAMPS), 10 s by default. Short windows show how the costs follow what's on
+// screen.
+inline u64 ReportWindowNs() {
+    static const u64 window = [] {
+        const char* value = std::getenv("EDEN_NX2_REPORT_SECONDS");
+        const double seconds = value ? std::strtod(value, nullptr) : 0.0;
+        return static_cast<u64>((seconds >= 0.5 ? seconds : 10.0) * 1e9);
+    }();
+    return window;
 }
 
 // Nanoseconds; from the host's own counter where the wall clock reads it directly (the zones
@@ -146,7 +159,7 @@ inline void Add(Counter counter, u64 amount) {
 }
 
 /// Called by the GPU thread (and the split's back thread) between commands: logs and resets
-/// the totals every 10 s.
+/// the totals every report window (ReportWindowNs).
 inline void Report(const char* thread_name = "GPU thread") {
     if (!Enabled()) {
         return;
@@ -159,7 +172,7 @@ inline void Report(const char* thread_name = "GPU thread") {
         return;
     }
     const u64 window = now - data.window_start;
-    if (window < 10'000'000'000ULL) {
+    if (window < ReportWindowNs()) {
         return;
     }
     // Time in no zone at all is the wall time minus the zones' totals.

@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "common/logging.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_gpu_timer.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -107,7 +108,7 @@ void GpuTimer::Collect(const MasterSemaphore& semaphore) {
         since = now;
     }
     const double seconds = std::chrono::duration<double>(now - since).count();
-    if (seconds >= 10.0) {
+    if (seconds * 1e9 >= static_cast<double>(VideoCommon::Nx2Profile::ReportWindowNs())) {
         Report(seconds);
         totals.clear();
         submissions = 0;
